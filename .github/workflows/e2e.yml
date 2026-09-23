@@ -24,11 +24,11 @@ jobs:
           mise run observability-up
           until curl -sf http://127.0.0.1:8428/health; do sleep 1; done
 
-      - name: Stage embed
-        run: mise run stage-embed
+      - name: Install go-tpc
+        run: mise run install-go-tpc
 
       - name: Build benchctl
-        run: go build -o benchctl ./cmd/benchctl
+        run: mise build
 
       - name: Run local scenario
         run: |
