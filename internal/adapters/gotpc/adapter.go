@@ -56,16 +56,13 @@ func isPrepare(step schema.SuiteStep) bool {
 }
 
 // Run executes the step and returns parsed metrics. The go-tpc "prepare"
-// subcommand measures nothing and so returns empty Metrics.
+// subcommand does not measure anything thus returning empty Metrics.
 //
 // A measured step always passes go-tpc's --summary-file/--raw-samples-file
 // (see https://github.com/supabase/go-tpc's pkg/measurement), pointed at
-// adapter-owned scratch paths a scenario never sees or configures; this is
-// internal plumbing, the same way go-tpc's "prepare --output-dir" is
-// caller-managed rather than scenario-facing. The adapter reads the summary
-// file back and translates it directly into engine.MetricPoints (no stdout
-// regex parsing), and reads the raw-samples file back verbatim into
-// metrics["raw_samples_csv"]. Both scratch files are deleted once read.
+// adapter-owned scratch paths. The adapter reads the summary
+// file and translates it directly into engine.MetricPoints. It also reads 
+// the raw-samples file back verbatim into metrics["raw_samples_csv"].
 func (a *Adapter) Run(ctx context.Context, outputs engine.Outputs, step schema.SuiteStep) (engine.Metrics, error) {
 	if isPrepare(step) {
 		return a.prepare(ctx, outputs, step)

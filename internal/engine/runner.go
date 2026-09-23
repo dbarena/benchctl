@@ -424,6 +424,7 @@ func (r *Runner) Run(ctx context.Context, s *schema.Scenario, inputs schema.Reso
 							return fmt.Errorf("suite step %s: %w", step.Name, collectErr)
 						}
 						if len(pts) > 0 {
+							tagPointsWithStep(pts, step.Name)
 							if workloadMetrics == nil {
 								workloadMetrics = make(Metrics)
 							}
@@ -447,6 +448,7 @@ func (r *Runner) Run(ctx context.Context, s *schema.Scenario, inputs schema.Reso
 						if execErr != nil {
 							return fmt.Errorf("execute: %w", execErr)
 						}
+						labelStepMetrics(stepMetrics, step.Name)
 						mergeMetrics(&workloadMetrics, stepMetrics)
 						r.setState(runID, func(st *runstate.State) {
 							if isLastOverall && si == lastWorkloadIdx {
@@ -949,6 +951,7 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 							return fmt.Errorf("suite step %s: %w", step.Name, collectErr)
 						}
 						if len(pts) > 0 {
+							tagPointsWithStep(pts, step.Name)
 							if workloadMetrics == nil {
 								workloadMetrics = make(Metrics)
 							}
@@ -973,6 +976,7 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 							if execErr != nil {
 								return fail(runstate.PhaseWorkloadExecute, fmt.Errorf("execute: %w", execErr))
 							}
+							labelStepMetrics(stepMetrics, step.Name)
 							mergeMetrics(&workloadMetrics, stepMetrics)
 							r.setState(runID, func(st *runstate.State) {
 								if isLastOverall && si == lastWorkloadIdx {
@@ -1247,6 +1251,32 @@ func mergeMetrics(dst *Metrics, src Metrics) {
 		maps.Copy(sm.InfoLabels, srcPoints.InfoLabels)
 	}
 	(*dst)[StructuredKey] = sm
+}
+
+// labelStepMetrics adds a "step" label to every structured point and 
+// namespaces m["raw_samples_csv"] (go-tpc's per-tick CSV, if present) by
+// step name via RawSamplesCSVKey so that multiple steps contributing to 
+// the same metric family (e.g. a warm-up run followed by the measured run) 
+// stay distinguishable.
+func labelStepMetrics(m Metrics, stepName string) {
+	if sm, ok := m[StructuredKey].(StructuredMetrics); ok {
+		tagPointsWithStep(sm.Points, stepName)
+		m[StructuredKey] = sm
+	}
+	if raw, ok := m["raw_samples_csv"].(string); ok && raw != "" {
+		delete(m, "raw_samples_csv")
+		m[RawSamplesCSVKey(stepName)] = raw
+	}
+}
+
+// tagPointsWithStep sets a "step" label to stepName on every point.
+func tagPointsWithStep(points []MetricPoint, stepName string) {
+	for i := range points {
+		if points[i].Labels == nil {
+			points[i].Labels = map[string]string{}
+		}
+		points[i].Labels["step"] = stepName
+	}
 }
 
 // writeInitialMetadata resolves the collector config and writes a partial
