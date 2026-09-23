@@ -1,0 +1,224 @@
+name: Update pinned AMI
+on:
+  schedule:
+    # TODO: Disabled until the ARN targets this repo + GH_APP_PUSH_CLIENT_ID / GH_APP_PUSH_PRIVATE_KEY are resolved.
+    # Every Monday at 08:00 UTC — same cadence as Dependabot.
+    #- cron: "0 8 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+env:
+  AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+jobs:
+  update-ami:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get App Token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ secrets.GH_APP_PUSH_CLIENT_ID }}
+          private-key: ${{ secrets.GH_APP_PUSH_PRIVATE_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # aws-region is required by the action (sets the STS endpoint for AssumeRoleWithWebIdentity).
+      # The resulting IAM credentials are global — subsequent steps pass --region explicitly and
+      # can query any region without re-assuming the role.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: eu-central-1
+          # Needs ec2:DescribeImages on *.
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+
+      - name: Prepare helpers
+        run: |
+          set -euo pipefail
+
+          # Write the manifest-diff script once; the update step calls it per region.
+          cat > "$RUNNER_TEMP/diff_manifests.py" << 'PY'
+          import sys
+
+          def load(p):
+              out = {}
+              with open(p) as f:
+                  for line in f:
+                      if "\t" in line:
+                          pkg, ver = line.split("\t", 1)
+                          out[pkg.strip()] = ver.strip()
+              return out
+
+          prev_f, new_f = sys.argv[1], sys.argv[2]
+          old, new = load(prev_f), load(new_f)
+          added   = sorted(set(new) - set(old))
+          removed = sorted(set(old) - set(new))
+          changed = sorted((p, old[p], new[p]) for p in set(old) & set(new) if old[p] != new[p])
+
+          def section(title, items, fmt):
+              if not items:
+                  return
+              print(f"**{title}** ({len(items)})\n")
+              print("```")
+              for it in items:
+                  print(fmt(it))
+              print("```\n")
+
+          section("Upgraded", changed, lambda x: f"{x[0]}: {x[1]} -> {x[2]}")
+          section("Added",    added,   lambda p: p)
+          section("Removed",  removed, lambda p: p)
+          if not (added or removed or changed):
+              print("_No package changes between the two source builds._")
+          PY
+
+          # Fetch Ubuntu daily stream metadata once; reused for serial resolution for all regions.
+          curl -fsSL \
+            "https://cloud-images.ubuntu.com/daily/streams/v1/com.ubuntu.cloud:daily:download.json" \
+            | jq -r \
+              '.products["com.ubuntu.cloud.daily:server:24.04:arm64"].versions | keys | sort | .[]' \
+            > "$RUNNER_TEMP/ubuntu_serials.txt"
+
+      - name: Resolve and update AMIs
+        id: update
+        run: |
+          set -euo pipefail
+
+          REGIONS=(eu-central-1 us-east-1)
+          ANY_CHANGED=false
+
+          # resolve <serial> — returns the most-recent upstream source build <= serial.
+          # Canonical re-publishes AMIs more often than it updates upstream daily builds,
+          # so we walk back to the nearest build whose manifest we can actually fetch.
+          resolve() {
+            awk -v t="$1" '$0 <= t' "$RUNNER_TEMP/ubuntu_serials.txt" | tail -1
+          }
+
+          # Initialise the PR body table; rows are appended per region below.
+          cat > "$RUNNER_TEMP/pr_body.md" << 'HEADER'
+          Weekly AMI refresh for all EC2 deployment modules.
+
+          | Region | Status | Previous | Latest | Build | Upstream diff |
+          |--------|--------|----------|--------|-------|---------------|
+          HEADER
+
+          for REGION in "${REGIONS[@]}"; do
+            SAFE=${REGION//-/_}
+
+            LATEST=$(aws ec2 describe-images \
+              --region "$REGION" \
+              --owners 099720109477 \
+              --filters \
+                "Name=name,Values=ubuntu/images/hvm-ssd*/ubuntu-noble-24.04-arm64-server-*" \
+                "Name=virtualization-type,Values=hvm" \
+                "Name=architecture,Values=arm64" \
+              --query 'sort_by(Images,&CreationDate)[-1].{id:ImageId,name:Name}' \
+              --output json)
+            NEW_ID=$(echo "$LATEST"   | jq -r '.id')
+            NEW_NAME=$(echo "$LATEST" | jq -r '.name')
+
+            if [ -z "$NEW_ID" ] || [ "$NEW_ID" = "null" ]; then
+              echo "No AMI found for region $REGION" >&2
+              exit 1
+            fi
+
+            CURRENT=$(grep "\"$REGION\"\s*=\s*\"ami-" \
+              deployments/ec2/postgres/variables.tf | grep -oP 'ami-[a-f0-9]+')
+
+            if [ "$CURRENT" = "$NEW_ID" ]; then
+              printf '| `%s` | no change | `%s` | — | — | — |\n' \
+                "$REGION" "$CURRENT" >> "$RUNNER_TEMP/pr_body.md"
+              continue
+            fi
+
+            PREV=$(grep -oP "${REGION},\s*build \K[0-9]{8}" \
+              deployments/ec2/postgres/variables.tf) || {
+              echo "Could not extract build serial for $REGION from variables.tf — check comment format" >&2
+              exit 1
+            }
+            NEW_SERIAL=$(echo "$NEW_NAME" | grep -oP '\d{8}$') || {
+              echo "Could not extract build serial from AMI name '$NEW_NAME' for $REGION" >&2
+              exit 1
+            }
+
+            PREV_SRC=$(resolve "$PREV")
+            NEW_SRC=$(resolve "$NEW_SERIAL")
+
+            if [ -z "$PREV_SRC" ] || [ -z "$NEW_SRC" ]; then
+              echo "Could not resolve upstream source builds for $REGION" \
+                "(PREV=$PREV→'$PREV_SRC', NEW=$NEW_SERIAL→'$NEW_SRC')" >&2
+              exit 1
+            fi
+
+            if [ "$PREV_SRC" = "$NEW_SRC" ]; then
+              printf '| `%s` | republish | `%s` | `%s` | `%s` | — |\n' \
+                "$REGION" "$CURRENT" "$NEW_ID" "$NEW_SERIAL" >> "$RUNNER_TEMP/pr_body.md"
+              {
+                echo "## AWS-only republish ($REGION) — skipping"
+                echo
+                echo "- Pinned: \`$CURRENT\` (build \`$PREV\`)"
+                echo "- Latest: \`$NEW_ID\` (build \`$NEW_SERIAL\`)"
+                echo "- Both derive from upstream build \`$PREV_SRC\`."
+              } >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            for f in \
+              deployments/ec2/postgres/variables.tf \
+              deployments/ec2/loaddriver-k6/variables.tf \
+              deployments/ec2/loaddriver_gotpc/variables.tf; do
+              sed -i "s/\"$REGION\"[[:space:]]*=[[:space:]]*\"ami-[^\"]*\"/\"$REGION\" = \"$NEW_ID\"/" "$f"
+              sed -i "s/$REGION,[[:space:]]*build [0-9]\{8\}/$REGION, build $NEW_SERIAL/" "$f"
+            done
+
+            BASE=https://cloud-images.ubuntu.com/noble
+            curl -fsSL "$BASE/$PREV_SRC/noble-server-cloudimg-arm64.manifest" \
+              -o "$RUNNER_TEMP/${SAFE}_prev.txt"
+            curl -fsSL "$BASE/$NEW_SRC/noble-server-cloudimg-arm64.manifest" \
+              -o "$RUNNER_TEMP/${SAFE}_new.txt"
+
+            python3 "$RUNNER_TEMP/diff_manifests.py" \
+              "$RUNNER_TEMP/${SAFE}_prev.txt" \
+              "$RUNNER_TEMP/${SAFE}_new.txt" \
+              > "$RUNNER_TEMP/${SAFE}_changelog.md"
+
+            printf '| `%s` | updated | `%s` | `%s` | `%s` | `%s` → `%s` |\n' \
+              "$REGION" "$CURRENT" "$NEW_ID" "$NEW_SERIAL" "$PREV_SRC" "$NEW_SRC" \
+              >> "$RUNNER_TEMP/pr_body.md"
+
+            ANY_CHANGED=true
+          done
+
+          # Append changelog details for each updated region.
+          for REGION in "${REGIONS[@]}"; do
+            SAFE=${REGION//-/_}
+            CL="$RUNNER_TEMP/${SAFE}_changelog.md"
+            [ -f "$CL" ] || continue
+            printf '\n<details><summary>Package changes (%s)</summary>\n\n' \
+              "$REGION" >> "$RUNNER_TEMP/pr_body.md"
+            cat "$CL" >> "$RUNNER_TEMP/pr_body.md"
+            printf '\n</details>\n' >> "$RUNNER_TEMP/pr_body.md"
+          done
+
+          # Append static footer.
+          cat >> "$RUNNER_TEMP/pr_body.md" << 'FOOTER'
+
+          Modules updated:
+          - `deployments/ec2/postgres`
+          - `deployments/ec2/loaddriver-k6`
+          - `deployments/ec2/loaddriver_gotpc`
+
+          Triggered by the `update-ami` workflow.
+          FOOTER
+
+          echo "any_changed=$ANY_CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: steps.update.outputs.any_changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: chore/update-ami
+          commit-message: "chore: update Ubuntu 24.04 ARM64 AMIs"
+          title: "chore: update Ubuntu 24.04 ARM64 AMIs"
+          body-path: ${{ runner.temp }}/pr_body.md
+          labels: dependencies
