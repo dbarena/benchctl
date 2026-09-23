@@ -61,7 +61,7 @@ func isPrepare(step schema.SuiteStep) bool {
 // A measured step always passes go-tpc's --summary-file/--raw-samples-file
 // (see https://github.com/supabase/go-tpc's pkg/measurement), pointed at
 // adapter-owned scratch paths. The adapter reads the summary
-// file and translates it directly into engine.MetricPoints. It also reads 
+// file and translates it directly into engine.MetricPoints. It also reads
 // the raw-samples file back verbatim into metrics["raw_samples_csv"].
 func (a *Adapter) Run(ctx context.Context, outputs engine.Outputs, step schema.SuiteStep) (engine.Metrics, error) {
 	if isPrepare(step) {

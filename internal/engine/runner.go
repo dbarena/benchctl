@@ -1253,10 +1253,10 @@ func mergeMetrics(dst *Metrics, src Metrics) {
 	(*dst)[StructuredKey] = sm
 }
 
-// labelStepMetrics adds a "step" label to every structured point and 
+// labelStepMetrics adds a "step" label to every structured point and
 // namespaces m["raw_samples_csv"] (go-tpc's per-tick CSV, if present) by
-// step name via RawSamplesCSVKey so that multiple steps contributing to 
-// the same metric family (e.g. a warm-up run followed by the measured run) 
+// step name via RawSamplesCSVKey so that multiple steps contributing to
+// the same metric family (e.g. a warm-up run followed by the measured run)
 // stay distinguishable.
 func labelStepMetrics(m Metrics, stepName string) {
 	if sm, ok := m[StructuredKey].(StructuredMetrics); ok {
