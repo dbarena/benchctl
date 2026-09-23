@@ -1,0 +1,42 @@
+sources:
+  host_metrics:
+    type: host_metrics
+    scrape_interval_secs: ${host_metrics_scrape_interval_secs}
+    collectors:
+      - cpu
+      - disk
+      - load
+      - memory
+      - network
+      - process
+    process:
+      processes:
+        includes:
+          - k6
+  internal_metrics:
+    type: internal_metrics
+    scrape_interval_secs: 60
+sinks:
+%{ if sink == "victoriametrics" && victoriametrics_endpoint != "" ~}
+  out:
+    type: prometheus_remote_write
+    inputs:
+      - host_metrics
+      - internal_metrics
+    endpoint: "${victoriametrics_endpoint}/api/v1/write"
+%{ if victoriametrics_token != "" ~}
+    auth:
+      strategy: bearer
+      token: "${victoriametrics_token}"
+%{ endif ~}
+%{ else ~}
+  out:
+    type: file
+    inputs:
+      - host_metrics
+      - internal_metrics
+    path: /var/log/vector/metrics.log
+    compression: none
+    encoding:
+      codec: json
+%{ endif ~}

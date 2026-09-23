@@ -1,0 +1,47 @@
+# echo-fixtures-demo.yaml — local demo of fixture Cartesian-product expansion
+#
+# Demonstrates all three fixture types using shorthand syntax, an int input
+# reference (max_clients) for a range fixture, a list input reference
+# (protocol) for a list fixture, and the shell step type. Requires no
+# infrastructure.
+#
+# Run:
+#   benchctl run scenarios/echo-fixtures-demo.yaml
+#   benchctl run scenarios/echo-fixtures-demo.yaml --set max_clients=2
+#   benchctl run scenarios/echo-fixtures-demo.yaml --set protocol=simple,extended,binary
+apiVersion: bench/v1
+kind: Scenario
+metadata:
+  name: echo-fixtures-demo
+inputs:
+  max_clients:
+    type: int
+    default: 4
+    description: Upper bound of the range fixture (clients)
+  protocol:
+    type: list
+    default: [simple, extended]
+    description: Postgres wire protocols to test as a list fixture
+target:
+  provider: noop
+suite:
+  fixtures:
+    - scale: 10
+    - clients:
+      from: 1
+      to: "{{ inputs.max_clients }}"
+    - protocol:
+        type: list
+        params:
+          values: "{{ inputs.protocol }}"
+  benchmarks:
+    - name: echo
+      steps:
+        - name: print-combo
+          type: shell
+          args:
+            command: "echo scale={{ fixture.scale }} clients={{ fixture.clients }} protocol={{ fixture.protocol }}"
+driver:
+  provider: local
+collector:
+  provider: stdout

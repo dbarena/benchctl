@@ -1,0 +1,141 @@
+[tools]
+go = "latest"
+golangci-lint = "latest"
+
+[tasks.stage-embed]
+description = "Stage symlink-free copies of deployments/ and services/ for go:embed"
+run = """
+rm -rf internal/bundle/embedded/deployments
+mkdir -p internal/bundle/embedded/deployments
+cp -RL deployments/. internal/bundle/embedded/deployments/
+rm -rf internal/bundle/embedded/services
+mkdir -p internal/bundle/embedded/services
+cp -RL services/. internal/bundle/embedded/services/
+"""
+
+[tasks.build]
+description = "Build benchctl for the current platform"
+depends = ["stage-embed"]
+run = """
+VERSION=${BENCHCTL_RELEASE_VERSION:-$(cat VERSION)+$(date +%Y%m%d)-$(git rev-parse --short HEAD)}
+BUILDKIND=${BENCHCTL_BUILD_KIND:-dev}
+CGO_ENABLED=0 go build -buildvcs=false -ldflags "-s -w \
+  -X github.com/dbarena/benchctl/internal/buildinfo.Version=${VERSION} \
+  -X github.com/dbarena/benchctl/internal/buildinfo.BuildKind=${BUILDKIND} \
+  -X github.com/dbarena/benchctl/internal/buildinfo.SourceDir=$(pwd) \
+  -X github.com/dbarena/benchctl/internal/buildinfo.Commit=$(git rev-parse --short HEAD)" -o benchctl ./cmd/benchctl/
+"""
+
+[tasks.test]
+description = "Run all tests"
+depends = ["stage-embed"]
+run = "go test ./..."
+
+[tasks.build-linux]
+description = "Cross-compile benchctl for Linux (amd64 and arm64) into ./bin/"
+depends = ["stage-embed"]
+run = """
+mkdir -p bin
+VERSION=${BENCHCTL_RELEASE_VERSION:-$(cat VERSION)+$(date +%Y%m%d)-$(git rev-parse --short HEAD)}
+BUILDKIND=${BENCHCTL_BUILD_KIND:-dev}
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags "-s -w \
+  -X github.com/dbarena/benchctl/internal/buildinfo.Version=${VERSION} \
+  -X github.com/dbarena/benchctl/internal/buildinfo.BuildKind=${BUILDKIND} \
+  -X github.com/dbarena/benchctl/internal/buildinfo.SourceDir=$(pwd) \
+  -X github.com/dbarena/benchctl/internal/buildinfo.Commit=$(git rev-parse --short HEAD)" -o bin/benchctl-linux-amd64 ./cmd/benchctl/
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -ldflags "-s -w \
+  -X github.com/dbarena/benchctl/internal/buildinfo.Version=${VERSION} \
+  -X github.com/dbarena/benchctl/internal/buildinfo.BuildKind=${BUILDKIND} \
+  -X github.com/dbarena/benchctl/internal/buildinfo.SourceDir=$(pwd) \
+  -X github.com/dbarena/benchctl/internal/buildinfo.Commit=$(git rev-parse --short HEAD)" -o bin/benchctl-linux-arm64 ./cmd/benchctl/
+"""
+
+[tasks.build-darwin]
+description = "Cross-compile benchctl for macOS (amd64 and arm64) into ./bin/"
+depends = ["stage-embed"]
+run = """
+mkdir -p bin
+VERSION=${BENCHCTL_RELEASE_VERSION:-$(cat VERSION)+$(date +%Y%m%d)-$(git rev-parse --short HEAD)}
+BUILDKIND=${BENCHCTL_BUILD_KIND:-dev}
+CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -buildvcs=false -ldflags "-s -w \
+  -X github.com/dbarena/benchctl/internal/buildinfo.Version=${VERSION} \
+  -X github.com/dbarena/benchctl/internal/buildinfo.BuildKind=${BUILDKIND} \
+  -X github.com/dbarena/benchctl/internal/buildinfo.SourceDir=$(pwd) \
+  -X github.com/dbarena/benchctl/internal/buildinfo.Commit=$(git rev-parse --short HEAD)" -o bin/benchctl-darwin-amd64 ./cmd/benchctl/
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -buildvcs=false -ldflags "-s -w \
+  -X github.com/dbarena/benchctl/internal/buildinfo.Version=${VERSION} \
+  -X github.com/dbarena/benchctl/internal/buildinfo.BuildKind=${BUILDKIND} \
+  -X github.com/dbarena/benchctl/internal/buildinfo.SourceDir=$(pwd) \
+  -X github.com/dbarena/benchctl/internal/buildinfo.Commit=$(git rev-parse --short HEAD)" -o bin/benchctl-darwin-arm64 ./cmd/benchctl/
+"""
+
+[tasks.build-all]
+description = "Cross-compile benchctl for all supported platforms into ./bin/"
+depends = ["build-linux", "build-darwin"]
+
+[tasks.version]
+description = "Print the current dev version string"
+run = "echo ${BENCHCTL_RELEASE_VERSION:-$(cat VERSION)+$(date +%Y%m%d)-$(git rev-parse --short HEAD)}"
+
+[tasks.lint]
+description = "Run gofmt -l, go vet, and golangci-lint"
+depends = ["stage-embed"]
+run = """
+out=$(gofmt -l .)
+if [ -n "$out" ]; then
+  echo "gofmt: the following files need formatting:"
+  echo "$out"
+  exit 1
+fi
+go vet ./...
+golangci-lint run
+"""
+
+[tasks.format]
+description = "Format all Go source files with gofmt"
+run = "gofmt -w ."
+
+[tasks.install-go-tpc]
+quiet = true
+# TODO: Use go install github.com/supabase/go-tpc/cmd/go-tpc@latest instead once there is an actual release (this command won't work for pre-releases)
+description = "Install go-tpc to $GOPATH/bin for ad-hoc use"
+run = """
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+curl -fsSL -L "https://github.com/supabase/go-tpc/releases/download/latest/go-tpc_latest_${OS}_${ARCH}.tar.gz" -o "$TMP/go-tpc.tar.gz"
+tar -xzf "$TMP/go-tpc.tar.gz" -C "$TMP"
+GOBIN=$(go env GOPATH)/bin
+mkdir -p "$GOBIN"
+mv "$TMP/go-tpc" "$GOBIN/go-tpc"
+chmod +x "$GOBIN/go-tpc"
+"""
+
+[tasks.install-k6]
+description = "Install the latest k6 to $GOPATH/bin for ad-hoc use with k6 scenarios"
+run = "go install go.k6.io/k6@latest"
+
+[tasks.observability-up]
+description = "Start local VictoriaMetrics + Grafana stack (VM :8428, Grafana :3000 admin/admin)"
+run = """
+docker compose -f deployments/local/observability.yml up -d
+echo "Connect to Grafana at http://localhost:3000/login (user: admin, password: admin)"
+"""
+
+[tasks.observability-down]
+description = "Stop local VictoriaMetrics + Grafana stack (preserves data volume)"
+run = "docker compose -f deployments/local/observability.yml down"
+
+[tasks.observability-reset]
+description = "Stop local VictoriaMetrics + Grafana stack and delete all stored metrics (down -v)"
+run = "docker compose -f deployments/local/observability.yml down -v"
+
+[tasks.test-integration]
+description = "Run integration tests against the local observability stack (starts and stops it automatically)"
+depends = ["stage-embed"]
+run = """
+docker compose -f deployments/local/observability.yml up -d
+go test -tags integration ./...
+docker compose -f deployments/local/observability.yml down -v
+"""

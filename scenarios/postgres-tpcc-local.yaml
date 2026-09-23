@@ -1,0 +1,102 @@
+# postgres-tpcc-local.yaml — Postgres TPC-C, local docker-compose
+apiVersion: bench/v1
+kind: Scenario
+metadata:
+  name: postgres-tpcc-local
+  labels:
+    engine: postgres
+    workload: tpcc
+    platform: local
+inputs:
+  warehouses:
+    type: int
+    default: 1
+    description: Number of warehouses to simulate
+  client_threads:
+    type: int
+    default: 2
+    description: Number of clients for the actual benchmark
+  duration:
+    type: duration
+    default: 1m
+    description: Duration of the actual benchmark
+  postgres_docker_image:
+    type: string
+    default: "postgres:17"
+    description: Docker image for the Postgres service
+  collector:
+    type: string
+    default: stdout
+    description: Collector provider to emit results to
+  effective_date:
+    type: string
+    default: ""
+    description: 'Metric timestamp override: "auto" (today, UTC midnight), "YYYYMMDD" (backfill), or empty for now'
+  file_enabled:
+    type: bool
+    default: false
+    description: Whether to write a results file to disk
+  ssl_mode:
+    type: string
+    default: disable
+    description: Postgres SSL mode for the docker-compose service
+  db_user:
+    type: string
+    default: "bench"
+    description: Postgres user name for the docker-compose service
+  db_password:
+    type: string
+    default: "bench"
+    description: Postgres password for the docker-compose service
+target:
+  provider: docker-compose
+  config:
+    services:
+      - name: postgres
+        definition: ./services/postgres/docker-compose.yml
+        vars:
+          image: "{{ inputs.postgres_docker_image }}"
+          user: "{{ inputs.db_user }}"
+          password: "{{ inputs.db_password }}"
+          db: tpcc
+          sslmode: "{{ inputs.ssl_mode }}"
+suite:
+  benchmarks:
+    - name: postgres
+      using: postgres
+      steps:
+        - name: get-pg-version
+          type: metadata
+          command: sql
+          args:
+            name: pg_version
+            query: "SELECT version()"
+        - name: prepare-warehouses
+          type: go-tpc
+          command: prepare
+          args:
+            warehouses: "{{ inputs.warehouses }}"
+            # parallelize data load - one thread per warehouse (data loading isn't CPU bound)
+            threads: "{{ inputs.warehouses }}"
+            no-check: ""
+        # Force a deterministic checkpoint right before measurement so the
+        # checkpoint timer fires from a known starting point and the prepare
+        # phase's writes are flushed before the benchmark begins.
+        - name: pre-benchmark-checkpoint
+          type: sql
+          args:
+            query: "CHECKPOINT"
+        - name: benchmark
+          type: go-tpc
+          command: run
+          args:
+            warehouses: "{{ inputs.warehouses }}"
+            threads: "{{ inputs.client_threads }}"
+            time: "{{ inputs.duration }}"
+driver:
+  provider: local
+collector:
+  provider: "{{ inputs.collector }}"
+  config:
+    effective_date: "{{ inputs.effective_date }}"
+    file_enabled: "{{ inputs.file_enabled }}"

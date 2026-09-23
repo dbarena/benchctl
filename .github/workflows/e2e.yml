@@ -1,0 +1,60 @@
+name: E2E Tests
+
+on:
+  pull_request:
+
+jobs:
+  e2e-local:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BENCHCTL_STORE_MODE: local
+      BENCHCTL_USERNAME: ${{ github.repository }}:${{ github.workflow }}:${{ github.job }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+      - name: Start observability stack
+        run: |
+          mise run observability-up
+          until curl -sf http://127.0.0.1:8428/health; do sleep 1; done
+
+      - name: Stage embed
+        run: mise run stage-embed
+
+      - name: Build benchctl
+        run: go build -o benchctl ./cmd/benchctl
+
+      - name: Run local scenario
+        run: |
+          ./benchctl run scenarios/postgres-tpcc-local.yaml \
+            --set warehouses=1 \
+            --set client_threads=2 \
+            --set duration=30s \
+            --set collector=victoriametrics
+        env:
+          BENCHCTL_METRICS_ENDPOINT: http://127.0.0.1:8428
+
+      - name: Verify run state
+        run: ./benchctl status --all
+
+      - name: Verify results
+        run: |
+          RUN_ID=$(./benchctl status -a | awk 'NR==2 {print $1}')
+          # Poll until VM flushes in-memory data (inmemoryDataFlushInterval default: 5s)
+          for i in {1..12}; do
+            sleep 5
+            OUTPUT=$(./benchctl results "$RUN_ID" 2>&1) && break
+            echo "Attempt $i: metrics not yet available, retrying..."
+          done
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "service:"
+          echo "$OUTPUT" | grep -q "pg_version:"
+          echo "$OUTPUT" | grep -q "NEW_ORDER"
+        env:
+          BENCHCTL_METRICS_ENDPOINT: http://127.0.0.1:8428

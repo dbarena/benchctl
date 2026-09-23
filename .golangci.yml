@@ -1,0 +1,27 @@
+# Configuration flows through internal/config exclusively, which applies the
+# env-var > config-file > default precedence for every key. Reading os.Getenv
+# or os.LookupEnv directly anywhere else bypasses that precedence, and that
+# package is the only place allowed to do so. The single exemption is
+# internal/providers/gcpcloudsql/network.go, which reads GOOGLE_CLOUD_PROJECT,
+# a standard GCP SDK convention rather than a benchctl config key.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - forbidigo
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: '^os\.Getenv$'
+          msg: "use internal/config instead of reading env vars directly"
+        - pattern: '^os\.LookupEnv$'
+          msg: "use internal/config instead of reading env vars directly"
+  exclusions:
+    rules:
+      - path: 'internal/config/'
+        linters: [forbidigo]
+      - path: 'internal/providers/gcpcloudsql/network\.go'
+        linters: [forbidigo]
+      - path: '_test\.go$'
+        linters: [forbidigo]

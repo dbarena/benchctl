@@ -1,0 +1,30 @@
+name: benchctl-observability
+
+services:
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.141.0
+    ports:
+      - "8428:8428"
+    command:
+      - -retentionPeriod=12
+      - -storageDataPath=/storage
+    volumes:
+      - vm-data:/storage
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - victoriametrics
+
+volumes:
+  vm-data:

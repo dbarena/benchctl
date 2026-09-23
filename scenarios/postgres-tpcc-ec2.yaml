@@ -1,0 +1,165 @@
+apiVersion: bench/v1
+kind: Scenario
+metadata:
+  name: postgres-tpcc-ec2
+  labels:
+    engine: postgres
+    workload: tpcc
+    platform: ec2
+inputs:
+  warehouses:
+    type: int
+    default: 320
+    description: Number of warehouses to simulate
+  client_threads:
+    type: int
+    default: 24
+    description: Number of clients for the actual benchmark
+  duration:
+    type: duration
+    default: 30m
+    description: Duration of the actual benchmark
+  benchmark_iterations:
+    type: int
+    default: 1
+    description: Number of times to repeat the benchmark suite
+  postgres_docker_image:
+    type: string
+    default: "postgres:17"
+    description: Docker image for the Postgres service
+  driver_instance_type:
+    type: string
+    default: c8gd.xlarge
+    description: Instance type of the load driver instance
+  target_instance_type:
+    type: string
+    default: c8gd.xlarge
+    description: Instance type of the target instance
+  region:
+    type: string
+    default: "eu-central-1"
+    description: AWS region to pick
+  collector:
+    type: string
+    default: stdout
+    description: Collector provider to emit results to
+  effective_date:
+    type: string
+    default: ""
+    description: 'Metric timestamp override: "auto" (today, UTC midnight), "YYYYMMDD" (backfill), or empty for now'
+  file_enabled:
+    type: bool
+    default: true
+    description: Whether to write a results file to disk
+  metrics_enabled:
+    type: bool
+    default: false
+    description: Whether to capture metrics in the environment
+  metrics_host_scrape_interval_secs:
+    type: int
+    default: 5
+    description: Interval in which to scrape load driver host metrics
+  metrics_postgres_scrape_interval_secs:
+    type: int
+    default: 15
+    description: Interval in which to scrape target Postgres metrics
+  db_user:
+    type: string
+    default: "bench"
+    description: Postgres user name for the docker-compose service
+  db_password:
+    type: string
+    default: "bench"
+    description: Postgres password for the docker-compose service
+  ssl_mode:
+    type: string
+    default: disable
+    description: Postgres SSL mode for the docker-compose service
+target:
+  provider: opentofu
+  config:
+    module: ./deployments/ec2/postgres
+    services:
+      - name: postgres
+        definition: ./services/postgres/docker-compose.yml
+        vars:
+          image: "{{ inputs.postgres_docker_image }}"
+          pgdata_volume: /mnt/nvme/pgdata
+          # Ubuntu 24.04 uses nftables; Docker's iptables-based DNAT (bridge mode) breaks
+          # after reboot. host networking bypasses iptables and is thus robust against restarts.
+          network_mode: host
+          user: "{{ inputs.db_user }}"
+          password: "{{ inputs.db_password }}"
+          db: tpcc
+          sslmode: "{{ inputs.ssl_mode }}"
+    vars:
+      instance_type: "{{ inputs.target_instance_type }}"
+      region: "{{ inputs.region }}"
+      vector_enabled: "{{ inputs.metrics_enabled }}"
+      vector_sink: "{{ inputs.collector }}"
+      vector_host_metrics_scrape_interval_secs: "{{ inputs.metrics_host_scrape_interval_secs }}"
+      vector_postgres_metrics_scrape_interval_secs: "{{ inputs.metrics_postgres_scrape_interval_secs }}"
+      pg_user: "{{ inputs.db_user }}"
+      pg_password: "{{ inputs.db_password }}"
+suite:
+  between-benchmarks:
+    - name: wipe-data
+      scope: target
+      command: shell
+      args: "sudo rm -rf /mnt/nvme/pgdata && sudo mkdir -p /mnt/nvme/pgdata"
+    - name: reboot
+      scope: target
+      command: reboot
+    - name: trim-disk
+      scope: target
+      command: trim
+  iterations: "{{ inputs.benchmark_iterations }}"
+  benchmarks:
+    - name: postgres
+      using: postgres
+      steps:
+        - name: get-pg-version
+          type: metadata
+          command: sql
+          args:
+            name: pg_version
+            query: "SELECT version()"
+        - name: prepare-warehouses
+          type: go-tpc
+          command: prepare
+          args:
+            warehouses: "{{ inputs.warehouses }}"
+            # parallelize data load
+            threads: "{{ inputs.client_threads }}"
+            no-check: ""
+        # Force a deterministic checkpoint right before measurement so the
+        # checkpoint timer fires from a known starting point and the prepare
+        # phase's writes are flushed before the benchmark begins.
+        - name: pre-benchmark-checkpoint
+          type: sql
+          args:
+            query: "CHECKPOINT"
+        - name: benchmark
+          type: go-tpc
+          command: run
+          args:
+            warehouses: "{{ inputs.warehouses }}"
+            threads: "{{ inputs.client_threads }}"
+            time: "{{ inputs.duration }}"
+driver:
+  provider: ec2
+  config:
+    module: ./deployments/ec2/loaddriver_gotpc
+    vars:
+      instance_type: "{{ inputs.driver_instance_type }}"
+      region: "{{ inputs.region }}"
+      subnet_id: "{{ target.outputs.subnet_id }}"
+      placement_group_name: "{{ target.outputs.placement_group_name }}"
+      vector_enabled: "{{ inputs.metrics_enabled }}"
+      vector_sink: "{{ inputs.collector }}"
+      vector_host_metrics_scrape_interval_secs: "{{ inputs.metrics_host_scrape_interval_secs }}"
+collector:
+  provider: "{{ inputs.collector }}"
+  config:
+    effective_date: "{{ inputs.effective_date }}"
+    file_enabled: "{{ inputs.file_enabled }}"

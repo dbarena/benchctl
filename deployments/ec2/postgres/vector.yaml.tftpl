@@ -1,0 +1,52 @@
+sources:
+  host_metrics:
+    type: host_metrics
+    scrape_interval_secs: ${host_metrics_scrape_interval_secs}
+    collectors:
+      - cpu
+      - disk
+      - load
+      - memory
+      - network
+      - process
+    process:
+      processes:
+        includes:
+          - postgres
+  internal_metrics:
+    type: internal_metrics
+    scrape_interval_secs: 60
+# postgresql_metrics disabled: Vector's postgresql_metrics source hard-fails on
+# PostgreSQL 17 because pg_stat_bgwriter no longer contains checkpoints_timed and
+# related columns (moved to pg_stat_checkpointer). Tracked at:
+# https://github.com/vectordotdev/vector/issues/22094
+#
+#  postgres_metrics:
+#    type: postgresql_metrics
+#    endpoints:
+#      - "${postgres_endpoint}"
+#    scrape_interval_secs: ${postgres_metrics_scrape_interval_secs}
+sinks:
+%{ if sink == "victoriametrics" && victoriametrics_endpoint != "" ~}
+  out:
+    type: prometheus_remote_write
+    inputs:
+      - host_metrics
+      - internal_metrics
+    endpoint: "${victoriametrics_endpoint}/api/v1/write"
+%{ if victoriametrics_token != "" ~}
+    auth:
+      strategy: bearer
+      token: "${victoriametrics_token}"
+%{ endif ~}
+%{ else ~}
+  out:
+    type: file
+    inputs:
+      - host_metrics
+      - internal_metrics
+    path: /var/log/vector/metrics.log
+    compression: none
+    encoding:
+      codec: json
+%{ endif ~}
