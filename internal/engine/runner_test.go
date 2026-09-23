@@ -999,6 +999,95 @@ func TestBetweenBenchmarks_RunsBetweenNotAfterLast(t *testing.T) {
 	}
 }
 
+// multiStepWorkload is a WorkloadAdapter fake that returns a distinct
+// tpcc_tpm point value and raw_samples_csv row per step name, so a test can
+// verify that two go-tpc "run" steps in one benchmark entry (e.g. a
+// "warm-up" step followed by "benchmark") stay distinguishable after
+// mergeMetrics folds them together.
+type multiStepWorkload struct {
+	calls *[]string
+}
+
+func (w *multiStepWorkload) Run(_ context.Context, _ engine.Outputs, step schema.SuiteStep) (engine.Metrics, error) {
+	*w.calls = append(*w.calls, "workload.run:"+step.Name)
+	value := 100.0
+	if step.Name == "benchmark" {
+		value = 200.0
+	}
+	return engine.Metrics{
+		engine.StructuredKey: engine.StructuredMetrics{
+			Points: []engine.MetricPoint{{Family: "tpcc_tpm", Labels: map[string]string{"transaction": "NEW_ORDER", "status": "ok"}, Value: value}},
+		},
+		"raw_samples_csv": fmt.Sprintf("t_seconds,transaction,tpm\n1.0,NEW_ORDER,%v\n", value),
+	}, nil
+}
+
+// metricsCapturingCollector records the final Metrics passed to Collect, for
+// tests that need to inspect merged structured points or flat keys rather
+// than just the collector's config labels.
+type metricsCapturingCollector struct {
+	calls   *[]string
+	metrics engine.Metrics
+}
+
+func (c *metricsCapturingCollector) Collect(_ context.Context, _ map[string]any, m engine.Metrics) error {
+	*c.calls = append(*c.calls, "collector.collect")
+	c.metrics = m
+	return nil
+}
+
+func TestWarmupAndBenchmarkSteps_StayDistinguishableAfterMerge(t *testing.T) {
+	var calls []string
+	cap := &metricsCapturingCollector{calls: &calls}
+	r := engine.Runner{
+		Target:    &stubTarget{calls: &calls},
+		Driver:    &stubDriver{calls: &calls},
+		Workloads: map[string]engine.WorkloadAdapter{"go-tpc": &multiStepWorkload{calls: &calls}},
+		Collector: cap,
+	}
+
+	s := minimalScenario()
+	s.Suite = schema.Suite{
+		Benchmarks: []schema.SuiteEntry{
+			{
+				Name: "supabase",
+				Steps: []schema.SuiteStep{
+					{Name: "warm-up", Type: "go-tpc", Command: "run"},
+					{Name: "benchmark", Type: "go-tpc", Command: "run"},
+				},
+			},
+		},
+	}
+
+	if err := r.Run(context.Background(), s, schema.ResolvedInputs{"warehouses": int64(10)}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	sm, ok := cap.metrics[engine.StructuredKey].(engine.StructuredMetrics)
+	if !ok || len(sm.Points) != 2 {
+		t.Fatalf("expected 2 structured points, got %#v", cap.metrics[engine.StructuredKey])
+	}
+	byStep := map[string]float64{}
+	for _, p := range sm.Points {
+		byStep[p.Labels["step"]] = p.Value
+	}
+	if byStep["warm-up"] != 100 || byStep["benchmark"] != 200 {
+		t.Errorf("points not distinguishable by step label: %#v", sm.Points)
+	}
+
+	if _, ok := cap.metrics["raw_samples_csv"]; ok {
+		t.Errorf("bare raw_samples_csv key should not survive the runner, got %v", cap.metrics["raw_samples_csv"])
+	}
+	warmupRaw, _ := cap.metrics[engine.RawSamplesCSVKey("warm-up")].(string)
+	if !strings.Contains(warmupRaw, "1.0,NEW_ORDER,100") {
+		t.Errorf("warm-up raw_samples_csv = %q", warmupRaw)
+	}
+	benchmarkRaw, _ := cap.metrics[engine.RawSamplesCSVKey("benchmark")].(string)
+	if !strings.Contains(benchmarkRaw, "1.0,NEW_ORDER,200") {
+		t.Errorf("benchmark raw_samples_csv = %q", benchmarkRaw)
+	}
+}
+
 func contains(slice []string, s string) bool {
 	for _, v := range slice {
 		if v == s {

@@ -1,5 +1,7 @@
 package engine
 
+import "strings"
+
 // MetricPoint is a single numeric observation from a benchmark run.
 // The Family and Labels are Prometheus-style; adapters are responsible
 // for naming them according to the benchmark standard (e.g. "tpcc_latency_ms").
@@ -24,3 +26,22 @@ type StructuredMetrics struct {
 // StructuredKey is the reserved key in a Metrics map that holds StructuredMetrics.
 // It starts with "_" to avoid collision with any real metric names.
 const StructuredKey = "_structured"
+
+// rawSamplesCSVPrefix namespaces a go-tpc step's raw CSV
+// (Adapter.Run's metrics["raw_samples_csv"]) by step name once it's tagged
+// via RawSamplesCSVKey, so that a warm-up step's CSV and a subsequent
+// measured step's end up as distinct Metrics entries instead of one
+// overwriting the other.
+const rawSamplesCSVPrefix = "raw_samples_csv:"
+
+// RawSamplesCSVKey returns the Metrics flat key under which a scenario
+// step's raw-samples CSV is stored, namespaced by the step's name.
+func RawSamplesCSVKey(stepName string) string {
+	return rawSamplesCSVPrefix + stepName
+}
+
+// IsRawSamplesCSVKey reports whether k was produced by RawSamplesCSVKey,
+// returning the step name it was tagged with.
+func IsRawSamplesCSVKey(k string) (step string, ok bool) {
+	return strings.CutPrefix(k, rawSamplesCSVPrefix)
+}

@@ -458,7 +458,7 @@ func TestCollect_FileNameSanitization(t *testing.T) {
 
 func TestCollect_RawSamplesCSVExcludedFromFlatDisplay(t *testing.T) {
 	const csvContent = "t_seconds,transaction,status,tpm\n1.0,NEW_ORDER,ok,600\n"
-	out := collect(t, engine.Metrics{"raw_samples_csv": csvContent, "tpm": float64(100)})
+	out := collect(t, engine.Metrics{engine.RawSamplesCSVKey("run"): csvContent, "tpm": float64(100)})
 	if strings.Contains(out, csvContent) {
 		t.Errorf("raw_samples_csv leaked into the flat key-value display:\n%s", out)
 	}
@@ -480,7 +480,7 @@ func TestCollect_RawSamplesCSVExcludedFromJSONEntries(t *testing.T) {
 		"iteration":    1,
 		"labels":       map[string]any{"benchmark": "mybench"},
 	}
-	collectWithCfg(t, cfg, engine.Metrics{"raw_samples_csv": "t_seconds,transaction,status,tpm\n1.0,NEW_ORDER,ok,600\n", "tpm": float64(100)})
+	collectWithCfg(t, cfg, engine.Metrics{engine.RawSamplesCSVKey("run"): "t_seconds,transaction,status,tpm\n1.0,NEW_ORDER,ok,600\n", "tpm": float64(100)})
 
 	data, err := os.ReadFile(filepath.Join(dir, "results_mybench_1.json"))
 	if err != nil {
@@ -491,7 +491,7 @@ func TestCollect_RawSamplesCSVExcludedFromJSONEntries(t *testing.T) {
 		t.Fatalf("unmarshal results json: %v", err)
 	}
 	for _, e := range entries {
-		if e["name"] == "raw_samples_csv" {
+		if name, _ := e["name"].(string); strings.HasPrefix(name, "raw_samples_csv") {
 			t.Errorf("raw_samples_csv should not appear as a results.json entry: %+v", e)
 		}
 	}
@@ -514,9 +514,9 @@ func TestCollect_WritesRawSamplesCSVWhenPresent(t *testing.T) {
 		"iteration":    3,
 		"labels":       map[string]any{"benchmark": "mybench", "fixture_threads": "12"},
 	}
-	out := collectWithCfg(t, cfg, engine.Metrics{"raw_samples_csv": csvContent})
+	out := collectWithCfg(t, cfg, engine.Metrics{engine.RawSamplesCSVKey("run"): csvContent})
 
-	expectedFile := filepath.Join(dir, "raw_samples_mybench_3_12.csv")
+	expectedFile := filepath.Join(dir, "raw_samples_mybench_3_12_run.csv")
 	if !strings.Contains(out, expectedFile) {
 		t.Errorf("stdout missing raw samples path %q:\n%s", expectedFile, out)
 	}
@@ -532,6 +532,50 @@ func TestCollect_WritesRawSamplesCSVWhenPresent(t *testing.T) {
 	// Written verbatim, not run through the JSON entries path.
 	if _, err := os.Stat(filepath.Join(dir, "results_mybench_3_12.json")); err != nil {
 		t.Errorf("results_*.json should still be written alongside it: %v", err)
+	}
+}
+
+// TestCollect_WritesSeparateRawSamplesCSVPerStep is the multi-step case this
+// naming exists for: a warm-up step and a benchmark step, each tagged with
+// its own engine.RawSamplesCSVKey, land in two distinct files rather than
+// one overwriting or being combined with the other.
+func TestCollect_WritesSeparateRawSamplesCSVPerStep(t *testing.T) {
+	dir := t.TempDir()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(orig) })
+
+	const warmupCSV = "t_seconds,transaction,status,tpm\n1.0,NEW_ORDER,ok,500\n"
+	const benchmarkCSV = "t_seconds,transaction,status,tpm\n1.0,NEW_ORDER,ok,600\n"
+	cfg := map[string]any{
+		"file_enabled": true,
+		"iteration":    1,
+		"labels":       map[string]any{"benchmark": "mybench"},
+	}
+	collectWithCfg(t, cfg, engine.Metrics{
+		engine.RawSamplesCSVKey("warm-up"):   warmupCSV,
+		engine.RawSamplesCSVKey("benchmark"): benchmarkCSV,
+	})
+
+	warmupData, err := os.ReadFile(filepath.Join(dir, "raw_samples_mybench_1_warm-up.csv"))
+	if err != nil {
+		t.Fatalf("warm-up raw samples file not created: %v", err)
+	}
+	if string(warmupData) != warmupCSV {
+		t.Errorf("warm-up raw samples file content = %q, want %q", warmupData, warmupCSV)
+	}
+
+	benchmarkData, err := os.ReadFile(filepath.Join(dir, "raw_samples_mybench_1_benchmark.csv"))
+	if err != nil {
+		t.Fatalf("benchmark raw samples file not created: %v", err)
+	}
+	if string(benchmarkData) != benchmarkCSV {
+		t.Errorf("benchmark raw samples file content = %q, want %q", benchmarkData, benchmarkCSV)
 	}
 }
 
@@ -577,7 +621,7 @@ func TestCollect_NoRawSamplesFileWhenFileDisabled(t *testing.T) {
 		"iteration":    1,
 		"labels":       map[string]any{"benchmark": "mybench"},
 	}
-	collectWithCfg(t, cfg, engine.Metrics{"raw_samples_csv": "t_seconds,transaction,status,tpm\n"})
+	collectWithCfg(t, cfg, engine.Metrics{engine.RawSamplesCSVKey("run"): "t_seconds,transaction,status,tpm\n"})
 
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 0 {

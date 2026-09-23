@@ -36,10 +36,10 @@ func newWithWriter(w io.Writer) *Collector {
 
 // Collect prints metrics to the writer. StructuredMetrics are rendered with
 // grouped, dot-padded lines; all other metrics are printed as key-value pairs.
-// "raw_output", "_structured", and "raw_samples_csv" are excluded from the
-// flat key-value section: the first two are large and internal, and
-// raw_samples_csv gets its own dedicated raw_samples_*.csv file below rather
-// than being dumped inline or duplicated into results_*.json's entries.
+// "raw_output", "_structured", and any engine.IsRawSamplesCSVKey key are
+// excluded from the flat key-value section: the first two are large and
+// internal, and each step's raw-samples CSV gets its own dedicated
+// raw_samples_*.csv file below (one per step, see writeRawSamplesCSV).
 //
 // If cfg["file_enabled"] is true, a CSV file named results_<benchmark>_<iteration>.csv
 // is written to the current working directory and its absolute path is printed.
@@ -50,12 +50,18 @@ func (c *Collector) Collect(_ context.Context, cfg map[string]any, metrics engin
 	}
 
 	keys := make([]string, 0, len(metrics))
+	var rawSamplesKeys []string
 	for k := range metrics {
-		if k != "raw_output" && k != engine.StructuredKey && k != "raw_samples_csv" {
+		if _, ok := engine.IsRawSamplesCSVKey(k); ok {
+			rawSamplesKeys = append(rawSamplesKeys, k)
+			continue
+		}
+		if k != "raw_output" && k != engine.StructuredKey {
 			keys = append(keys, k)
 		}
 	}
 	sort.Strings(keys)
+	sort.Strings(rawSamplesKeys)
 
 	fmt.Fprintln(c.w, "=== Results ===")
 	for _, k := range keys {
@@ -72,8 +78,13 @@ func (c *Collector) Collect(_ context.Context, cfg map[string]any, metrics engin
 		}
 		fmt.Fprintf(c.w, "Results also written to %s\n", absPath)
 
-		if raw, ok := metrics["raw_samples_csv"].(string); ok && raw != "" {
-			rawPath, err := writeRawSamplesCSV(cfg, raw)
+		for _, k := range rawSamplesKeys {
+			step, _ := engine.IsRawSamplesCSVKey(k)
+			raw, _ := metrics[k].(string)
+			if raw == "" {
+				continue
+			}
+			rawPath, err := writeRawSamplesCSV(cfg, step, raw)
 			if err != nil {
 				return fmt.Errorf("stdout collector: write raw samples csv: %w", err)
 			}
@@ -139,14 +150,14 @@ func artifactFilename(prefix, benchmarkName string, iteration int, fixtureParts 
 	return filename + "." + ext
 }
 
-// writeRawSamplesCSV writes go-tpc's raw per-tick samples verbatim (no
-// reparsing, since go-tpc already wrote the final CSV shape) to
-// raw_samples_<benchmark>_<iteration>[_<fixture_values>].csv in the current
-// working directory, mirroring writeJSON's naming, and returns its absolute
-// path.
-func writeRawSamplesCSV(cfg map[string]any, csvContent string) (string, error) {
+// writeRawSamplesCSV writes a step's raw per-tick samples verbatim to
+// raw_samples_<benchmark>_<iteration>[_<fixture_values>]_<step>.csv in the
+// current working directory and returns its absolute path. Suffixing by step
+// keeps a warm-up step's samples separate from a subsequent measured step's.
+func writeRawSamplesCSV(cfg map[string]any, step, csvContent string) (string, error) {
 	benchmarkName, iteration, fixtureParts := artifactNaming(cfg)
-	filename := artifactFilename("raw_samples", benchmarkName, iteration, fixtureParts, "csv")
+	parts := append(fixtureParts, sanitizeFilePart(step))
+	filename := artifactFilename("raw_samples", benchmarkName, iteration, parts, "csv")
 	if err := os.WriteFile(filename, []byte(csvContent), 0o644); err != nil {
 		return "", err
 	}
