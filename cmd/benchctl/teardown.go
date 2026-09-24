@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbarena/benchctl/internal/consolelog"
 	"github.com/dbarena/benchctl/internal/engine"
 	"github.com/dbarena/benchctl/internal/runstate"
 	"github.com/dbarena/benchctl/internal/tofustate"
@@ -80,7 +81,7 @@ func runTeardown(_ *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(os.Stderr, "==> Tearing down driver [%s]\n", state.DriverProvider)
+			consolelog.Println(os.Stderr, fmt.Sprintf("Tearing down driver [%s]", state.DriverProvider))
 			if err := driver.Teardown(ctx, engine.Outputs(state.DriverOutputs)); err != nil {
 				return fmt.Errorf("driver teardown: %w", err)
 			}
@@ -90,7 +91,7 @@ func runTeardown(_ *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "==> Tearing down target [%s]\n", state.TargetProvider)
+		consolelog.Println(os.Stderr, fmt.Sprintf("Tearing down target [%s]", state.TargetProvider))
 		if err := target.Teardown(ctx, engine.Outputs(state.TargetOutputs)); err != nil {
 			return fmt.Errorf("target teardown: %w", err)
 		}

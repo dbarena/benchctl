@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/dbarena/benchctl/internal/consolelog"
 	"github.com/dbarena/benchctl/internal/providers/opentofu"
 )
 
@@ -34,7 +35,7 @@ func PreApply(ctx context.Context, out io.Writer, run opentofu.RunFunc, cfg, var
 		vars = make(map[string]any)
 	}
 
-	fmt.Fprintf(out, "==> gcpcloudsql: importing existing GCP network resources (if any) for %q\n", networkName)
+	consolelog.Println(out, fmt.Sprintf("gcpcloudsql: importing existing GCP network resources (if any) for %q", networkName))
 
 	projectID, err := resolveGCPProjectID(ctx, vars)
 	if err != nil {
@@ -118,7 +119,7 @@ func importSharedGCPNetworkResources(ctx context.Context, out io.Writer, run ope
 			peeringAdopted = err == nil
 		}
 		if err != nil {
-			fmt.Fprintf(out, "==> gcpcloudsql: %s not found (or already exists elsewhere); apply will create it fresh\n", imp.address)
+			consolelog.Println(out, fmt.Sprintf("gcpcloudsql: %s not found (or already exists elsewhere); apply will create it fresh", imp.address))
 		}
 	}
 	return peeringAdopted

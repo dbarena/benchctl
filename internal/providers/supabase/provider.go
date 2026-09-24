@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/dbarena/benchctl/internal/config"
+	"github.com/dbarena/benchctl/internal/consolelog"
 	"github.com/dbarena/benchctl/internal/engine"
 )
 
@@ -356,7 +357,7 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 	}
 	args = append(args, runID) // positional: project name
 
-	fmt.Fprintf(p.out, "==> supabase: creating project %s in %s\n", runID, c.Region)
+	consolelog.Println(p.out, fmt.Sprintf("supabase: creating project %s in %s", runID, c.Region))
 	out, err := p.runCapture(ctx, env, args...)
 	if err != nil {
 		detail := cliErrorDetail(out)
@@ -382,7 +383,7 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 		}
 		return nil, createErr
 	}
-	fmt.Fprintf(p.out, "==> supabase: project created with ref %s, waiting for ACTIVE_HEALTHY\n", ref)
+	consolelog.Println(p.out, fmt.Sprintf("supabase: project created with ref %s, waiting for ACTIVE_HEALTHY", ref))
 
 	dbHost, err := p.waitForProject(ctx, env, c.Profile, workDir, ref, c.ConnectionMode)
 	if err != nil {
@@ -423,7 +424,7 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 // moment to list a just-created project. Recovery is best effort: any error
 // yields "" so the caller reports the original create failure unchanged.
 func (p *Provider) recoverCreatedProject(env []string, profile, orgID, workDir, runID string) string {
-	fmt.Fprintf(p.out, "==> supabase: create did not yield a project ref; checking projects list by name %s\n", runID)
+	consolelog.Println(p.out, fmt.Sprintf("supabase: create did not yield a project ref; checking projects list by name %s", runID))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -447,10 +448,10 @@ func (p *Provider) recoverCreatedProject(env []string, profile, orgID, workDir, 
 		if err != nil {
 			continue
 		}
-		fmt.Fprintf(p.out, "==> supabase: found project %s by name\n", ref)
+		consolelog.Println(p.out, fmt.Sprintf("supabase: found project %s by name", ref))
 		return ref
 	}
-	fmt.Fprintf(p.out, "==> supabase: no project named %s exists; nothing to clean up\n", runID)
+	consolelog.Println(p.out, fmt.Sprintf("supabase: no project named %s exists; nothing to clean up", runID))
 	return ""
 }
 
@@ -463,7 +464,7 @@ func (p *Provider) recoverCreatedProject(env []string, profile, orgID, workDir, 
 // self-cleanup itself fails, it returns enough outputs (project_ref, profile,
 // run_id) for `benchctl teardown <run-id>` to finish the job manually.
 func (p *Provider) selfCleanupOrPartialOutputs(env []string, profile, ref, runID, workDir string, origErr error) (engine.Outputs, error) {
-	fmt.Fprintf(p.out, "==> supabase: provisioning failed; deleting project %s to avoid an orphaned resource\n", ref)
+	consolelog.Println(p.out, fmt.Sprintf("supabase: provisioning failed; deleting project %s to avoid an orphaned resource", ref))
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cleanupCancel()
 	if delErr := p.deleteProject(cleanupCtx, env, profile, ref); delErr != nil {
@@ -484,10 +485,10 @@ func (p *Provider) selfCleanupOrPartialOutputs(env []string, profile, ref, runID
 func (p *Provider) deleteProject(ctx context.Context, env []string, profile, ref string) error {
 	args := globalArgs(profile)
 	args = append(args, "projects", "delete", "--yes", ref)
-	fmt.Fprintf(p.out, "==> supabase: deleting project %s\n", ref)
+	consolelog.Println(p.out, fmt.Sprintf("supabase: deleting project %s", ref))
 	if out, stderr, err := p.runCaptureErr(ctx, env, args...); err != nil {
 		if alreadyDeleted(stderr) {
-			fmt.Fprintf(p.out, "==> supabase: project %s already deleted, treating teardown as successful\n", ref)
+			consolelog.Println(p.out, fmt.Sprintf("supabase: project %s already deleted, treating teardown as successful", ref))
 		} else {
 			detail := cliErrorDetail(out)
 			return fmt.Errorf("supabase: projects delete %s: %w%s%s", ref, err, detail, authHint(err.Error()+detail))
@@ -567,7 +568,7 @@ func (p *Provider) waitForProject(ctx context.Context, env []string, profile, wo
 			if !errors.Is(err, errProjectNotListed) {
 				return "", err
 			}
-			fmt.Fprintf(p.out, "==> supabase: project not yet visible in projects list, retrying\n")
+			consolelog.Println(p.out, "supabase: project not yet visible in projects list, retrying")
 			select {
 			case <-ctx.Done():
 				return "", ctx.Err()
@@ -575,12 +576,12 @@ func (p *Provider) waitForProject(ctx context.Context, env []string, profile, wo
 			}
 			continue
 		}
-		fmt.Fprintf(p.out, "==> supabase: project status: %s\n", status)
+		consolelog.Println(p.out, fmt.Sprintf("supabase: project status: %s", status))
 		if status == "ACTIVE_HEALTHY" {
 			if !usesPooler(connectionMode) {
 				return host, nil
 			}
-			fmt.Fprintf(p.out, "==> supabase: waiting %s for pooler registration\n", poolerGrace)
+			consolelog.Println(p.out, fmt.Sprintf("supabase: waiting %s for pooler registration", poolerGrace))
 			select {
 			case <-ctx.Done():
 				return "", ctx.Err()
@@ -895,11 +896,11 @@ func (p *Provider) resizeDiskIfNeeded(ctx context.Context, dbHost, ref string, s
 		return fmt.Errorf("resize disk: get current size: %w", err)
 	}
 	if current.SizeGB >= sizeGB {
-		fmt.Fprintf(p.out, "==> supabase: disk already %d GB (requested %d GB), skipping resize\n", current.SizeGB, sizeGB)
+		consolelog.Println(p.out, fmt.Sprintf("supabase: disk already %d GB (requested %d GB), skipping resize", current.SizeGB, sizeGB))
 		return nil
 	}
 
-	fmt.Fprintf(p.out, "==> supabase: resizing disk %d GB -> %d GB at %d IOPS (%s)\n", current.SizeGB, sizeGB, iops, diskType)
+	consolelog.Println(p.out, fmt.Sprintf("supabase: resizing disk %d GB -> %d GB at %d IOPS (%s)", current.SizeGB, sizeGB, iops, diskType))
 	attrs := fmt.Sprintf(`"type":%q,"size_gb":%d,"iops":%d`, diskType, sizeGB, iops)
 	if throughputMibps > 0 && diskType != diskTypeIO2 {
 		attrs += fmt.Sprintf(`,"throughput_mibps":%d`, throughputMibps)
@@ -940,7 +941,7 @@ func (p *Provider) waitForDiskResize(ctx context.Context, url, token string, siz
 		}
 		last = attrs
 		if attrs.SizeGB >= sizeGB && attrs.Type == diskType && attrs.IOPS >= iops {
-			fmt.Fprintf(p.out, "==> supabase: disk resized to %d GB\n", attrs.SizeGB)
+			consolelog.Println(p.out, fmt.Sprintf("supabase: disk resized to %d GB", attrs.SizeGB))
 			return nil
 		}
 		if time.Now().After(deadline) {
