@@ -60,7 +60,14 @@ func (c *Collector) Preflight(_ map[string]any) error {
 
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return fmt.Errorf("victoriametrics collector: credentials rejected (status %d): check BENCHCTL_METRICS_TOKEN or BENCHCTL_METRICS_USERNAME/BENCHCTL_METRICS_PASSWORD", resp.StatusCode)
+		switch {
+		case c.cfg.Metrics.Token != "":
+			return fmt.Errorf("victoriametrics collector: credentials rejected (status %d): check BENCHCTL_METRICS_TOKEN", resp.StatusCode)
+		case username != "":
+			return fmt.Errorf("victoriametrics collector: credentials rejected (status %d): check BENCHCTL_METRICS_USERNAME/BENCHCTL_METRICS_PASSWORD", resp.StatusCode)
+		default:
+			return fmt.Errorf("victoriametrics collector: credentials rejected (status %d): no credentials configured; set BENCHCTL_METRICS_TOKEN or BENCHCTL_METRICS_USERNAME/BENCHCTL_METRICS_PASSWORD", resp.StatusCode)
+		}
 	case resp.StatusCode == http.StatusNotFound:
 		return fmt.Errorf("victoriametrics collector: import endpoint not found (status 404): metrics.endpoint (%s) must be the VictoriaMetrics base URL", endpoint)
 	case resp.StatusCode >= 500:

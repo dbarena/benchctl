@@ -60,6 +60,50 @@ func TestPreflight_StatusClassification(t *testing.T) {
 	}
 }
 
+func TestPreflight_CredentialsRejectedMessageNamesConfiguredMethod(t *testing.T) {
+	cases := []struct {
+		name      string
+		metrics   config.MetricsConfig
+		errSubstr string
+	}{
+		{
+			name:      "token configured",
+			metrics:   config.MetricsConfig{Token: "test-token"},
+			errSubstr: "check BENCHCTL_METRICS_TOKEN",
+		},
+		{
+			name:      "username/password configured",
+			metrics:   config.MetricsConfig{Username: "user", Password: "pass"},
+			errSubstr: "check BENCHCTL_METRICS_USERNAME/BENCHCTL_METRICS_PASSWORD",
+		},
+		{
+			name:      "no credentials configured",
+			metrics:   config.MetricsConfig{},
+			errSubstr: "no credentials configured",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotAuth string
+			srv := newTestServer(http.StatusUnauthorized, &gotAuth)
+			defer srv.Close()
+
+			tc.metrics.Endpoint = srv.URL
+			cfg := &config.Config{Metrics: tc.metrics}
+			c := New(cfg)
+			err := c.Preflight(nil)
+
+			if err == nil {
+				t.Fatalf("Preflight() = nil, want error containing %q", tc.errSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.errSubstr) {
+				t.Errorf("Preflight() error = %q, want substring %q", err.Error(), tc.errSubstr)
+			}
+		})
+	}
+}
+
 func TestPreflight_BasicAuthCarriedOnProbe(t *testing.T) {
 	var gotAuth string
 	srv := newTestServer(http.StatusOK, &gotAuth)
