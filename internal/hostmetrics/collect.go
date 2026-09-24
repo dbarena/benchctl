@@ -5,6 +5,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"time"
 
 	"github.com/dbarena/benchctl/internal/engine"
 )
@@ -24,14 +25,30 @@ var quantiles = []struct {
 	{"0.9999", 0.9999},
 }
 
-// Collect reads Vector's local metrics log at path and reduces the driver's
-// CPU and network utilization observed during the run to p99/p99.9/p99.99
-// MetricPoints. It returns (nil, nil), not an error, when path does not
-// exist: Vector may be disabled, may have failed to install (cloud-init
-// treats it as a best-effort sidecar), or the caller may be a driver type
-// nobody configured for metrics -- none of those are failures of the
-// benchmark run.
-func Collect(path string) ([]engine.MetricPoint, error) {
+// Cursor reduces Vector's cumulative host metrics log to CPU/network
+// utilization percentiles, once per call. Driver.Collect fires once per
+// benchmark entry, per fixture, per iteration within a single run -- all
+// reading the same ever-growing log file -- so a Cursor remembers the
+// latest sample timestamp it has already reported on and only considers
+// samples strictly after it on the next call. Without this, every fixture
+// after the first would get percentiles diluted by every fixture that ran
+// before it, instead of numbers scoped to its own execution window. The
+// zero value starts from the beginning of the log, so a fresh Cursor per
+// run (one per driver Provider instance) behaves correctly on its first
+// call.
+type Cursor struct {
+	lastSeen time.Time
+}
+
+// Collect reads Vector's local metrics log at path and reduces the samples
+// observed since the previous call on this Cursor (or since the beginning
+// of the log, on the first call) to p99/p99.9/p99.99 MetricPoints. It
+// returns (nil, nil), not an error, when path does not exist: Vector may be
+// disabled, may have failed to install (cloud-init treats it as a
+// best-effort sidecar), or the caller may be a driver type nobody
+// configured for metrics -- none of those are failures of the benchmark
+// run.
+func (c *Cursor) Collect(path string) ([]engine.MetricPoint, error) {
 	if path == "" {
 		path = DefaultLogPath
 	}
@@ -39,9 +56,20 @@ func Collect(path string) ([]engine.MetricPoint, error) {
 		return nil, nil
 	}
 
-	samples, err := ParseFile(path)
+	all, err := ParseFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("hostmetrics: %w", err)
+	}
+
+	since := c.lastSeen
+	samples := make([]Sample, 0, len(all))
+	for _, s := range all {
+		if s.Timestamp.After(since) {
+			samples = append(samples, s)
+		}
+		if s.Timestamp.After(c.lastSeen) {
+			c.lastSeen = s.Timestamp
+		}
 	}
 
 	// Rounded to the precision that's actually meaningful: a fraction of a
@@ -89,8 +117,8 @@ func round(v float64, decimals int) float64 {
 // Read/parse errors are logged to warn (which may be nil to discard them)
 // and never surface as an error: a driver without Vector configured is the
 // common case, not a failure, and this must never fail driver.collect.
-func AppendTo(metrics engine.Metrics, path string, warn io.Writer) engine.Metrics {
-	points, err := Collect(path)
+func (c *Cursor) AppendTo(metrics engine.Metrics, path string, warn io.Writer) engine.Metrics {
+	points, err := c.Collect(path)
 	if err != nil {
 		if warn != nil {
 			fmt.Fprintf(warn, "warning: hostmetrics: %v\n", err)

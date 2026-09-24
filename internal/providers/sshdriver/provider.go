@@ -77,8 +77,9 @@ type Config struct {
 // engine.Connector, and engine.ArtifactFetcher for SSH-reachable load
 // generators provisioned via OpenTofu.
 type Provider struct {
-	cfg Config
-	out io.Writer
+	cfg         Config
+	out         io.Writer
+	hostMetrics hostmetrics.Cursor
 }
 
 // New constructs a Provider for the given cloud Config.
@@ -194,7 +195,7 @@ func (*Provider) Setup(_ context.Context, _ map[string]any, _ engine.Outputs) er
 // resume` -- aside from folding in any driver-side CPU/network utilization
 // Vector captured (if present) into the result.
 func (p *Provider) Collect(_ context.Context, _ map[string]any, _ engine.Outputs, metrics engine.Metrics) (engine.Metrics, error) {
-	return hostmetrics.AppendTo(metrics, "", p.out), nil
+	return p.hostMetrics.AppendTo(metrics, "", p.out), nil
 }
 
 // Teardown runs `tofu destroy` using the work dir stored in outputs.
