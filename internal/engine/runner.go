@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/dbarena/benchctl/internal/buildinfo"
+	"github.com/dbarena/benchctl/internal/consolelog"
 	"github.com/dbarena/benchctl/internal/runstate"
 	"github.com/dbarena/benchctl/internal/schema"
 	"github.com/dbarena/benchctl/internal/tofustate"
@@ -94,7 +95,7 @@ func (r *Runner) initStateMu() {
 // logf writes a formatted phase message to r.Out. It is a no-op when Out is nil.
 func (r *Runner) logf(format string, args ...any) {
 	if r.Out != nil {
-		fmt.Fprintln(r.Out, phaseStyle.Sprintf("==> "+format, args...))
+		fmt.Fprintln(r.Out, phaseStyle.Sprintf("==> "+consolelog.Timestamp()+" "+format, args...))
 	}
 }
 

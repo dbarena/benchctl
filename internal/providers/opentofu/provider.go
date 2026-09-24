@@ -16,6 +16,7 @@ import (
 
 	"github.com/dbarena/benchctl/internal/bundle"
 	"github.com/dbarena/benchctl/internal/config"
+	"github.com/dbarena/benchctl/internal/consolelog"
 	"github.com/dbarena/benchctl/internal/engine"
 	"github.com/dbarena/benchctl/internal/tags"
 	"github.com/dbarena/benchctl/internal/tofustate"
@@ -81,7 +82,7 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 	// Copy .tf files into workDir so that tofu state lives there rather than
 	// in the module source directory. Modern OpenTofu no longer accepts a path
 	// argument to `tofu init`; the working directory must contain the files.
-	fmt.Fprintf(p.out, "==> opentofu: syncing module %s → %s\n", absModule, workDir)
+	consolelog.Println(p.out, fmt.Sprintf("opentofu: syncing module %s → %s", absModule, workDir))
 	if err := syncTFFiles(absModule, workDir); err != nil {
 		return nil, fmt.Errorf("opentofu: sync module: %w", err)
 	}
@@ -111,9 +112,9 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 	}
 
 	applyArgs := []string{"apply", "-auto-approve", "-input=false"}
-	fmt.Fprintf(p.out, "==> opentofu: apply\n")
+	consolelog.Println(p.out, "opentofu: apply")
 	if err := p.run(ctx, workDir, "tofu", applyArgs...); err != nil {
-		fmt.Fprintf(p.out, "==> opentofu: apply failed; attempting cleanup\n")
+		consolelog.Println(p.out, "opentofu: apply failed; attempting cleanup")
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cleanupCancel()
 		if destroyErr := p.run(cleanupCtx, workDir, "tofu", "destroy", "-auto-approve", "-input=false", "-suppress-forget-errors"); destroyErr != nil {
@@ -152,12 +153,12 @@ func (p *Provider) Teardown(ctx context.Context, outputs engine.Outputs) error {
 		return fmt.Errorf("opentofu: teardown: missing work dir in outputs")
 	}
 	if _, err := os.Stat(filepath.Join(workDir, ".terraform")); os.IsNotExist(err) {
-		fmt.Fprintf(p.out, "==> opentofu: init (provider cache missing, re-initializing)\n")
+		consolelog.Println(p.out, "opentofu: init (provider cache missing, re-initializing)")
 		if err := p.tofuInit(ctx, workDir); err != nil {
 			return fmt.Errorf("opentofu: init: %w", err)
 		}
 	}
-	fmt.Fprintf(p.out, "==> opentofu: destroy\n")
+	consolelog.Println(p.out, "opentofu: destroy")
 	// -suppress-forget-errors: some modules (e.g. gcp-cloudsql/postgres) mark
 	// shared, never-destroyed resources with lifecycle.destroy = false; without
 	// this flag, a destroy that "forgets" (rather than deletes) any resource
@@ -287,9 +288,9 @@ func (p *Provider) tofuInit(ctx context.Context, workDir string) error {
 	var lastErr error
 	for attempt := 1; attempt <= tofuInitMaxAttempts; attempt++ {
 		if attempt > 1 {
-			fmt.Fprintf(p.out, "==> opentofu: init retry %d/%d after: %v\n", attempt, tofuInitMaxAttempts, lastErr)
+			consolelog.Println(p.out, fmt.Sprintf("opentofu: init retry %d/%d after: %v", attempt, tofuInitMaxAttempts, lastErr))
 		} else {
-			fmt.Fprintf(p.out, "==> opentofu: init\n")
+			consolelog.Println(p.out, "opentofu: init")
 		}
 		lastErr = p.runEnv(ctx, workDir, env, "tofu", "init", "-input=false")
 		if lastErr == nil {

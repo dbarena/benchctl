@@ -24,6 +24,7 @@ import (
 	"github.com/dbarena/benchctl/internal/buildinfo"
 	"github.com/dbarena/benchctl/internal/bundle"
 	"github.com/dbarena/benchctl/internal/config"
+	"github.com/dbarena/benchctl/internal/consolelog"
 	"github.com/dbarena/benchctl/internal/engine"
 	"github.com/dbarena/benchctl/internal/tags"
 	"github.com/dbarena/benchctl/internal/tofustate"
@@ -127,12 +128,12 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 
 	// Copy .tf/.tftpl/.sh files into workDir; modern OpenTofu no longer accepts
 	// a path argument to `tofu init`; the working directory must contain the files.
-	fmt.Fprintf(p.out, "==> %s: syncing module %s → %s\n", p.cfg.ProviderName, absModule, workDir)
+	consolelog.Println(p.out, fmt.Sprintf("%s: syncing module %s → %s", p.cfg.ProviderName, absModule, workDir))
 	if err := syncTFFiles(absModule, workDir); err != nil {
 		return nil, fmt.Errorf("%s: sync module: %w", p.cfg.ProviderName, err)
 	}
 
-	fmt.Fprintf(p.out, "==> %s: tofu init\n", p.cfg.ProviderName)
+	consolelog.Println(p.out, fmt.Sprintf("%s: tofu init", p.cfg.ProviderName))
 	if err := p.runTofu(ctx, workDir, "init", "-input=false"); err != nil {
 		return nil, fmt.Errorf("%s: tofu init: %w", p.cfg.ProviderName, err)
 	}
@@ -150,9 +151,9 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 	}
 
 	applyArgs := []string{"apply", "-auto-approve", "-input=false"}
-	fmt.Fprintf(p.out, "==> %s: tofu apply\n", p.cfg.ProviderName)
+	consolelog.Println(p.out, fmt.Sprintf("%s: tofu apply", p.cfg.ProviderName))
 	if err := p.runTofu(ctx, workDir, applyArgs...); err != nil {
-		fmt.Fprintf(p.out, "==> %s: tofu apply failed; attempting cleanup\n", p.cfg.ProviderName)
+		consolelog.Println(p.out, fmt.Sprintf("%s: tofu apply failed; attempting cleanup", p.cfg.ProviderName))
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cleanupCancel()
 		if destroyErr := p.runTofu(cleanupCtx, workDir, "destroy", "-auto-approve", "-input=false"); destroyErr != nil {
@@ -200,12 +201,12 @@ func (p *Provider) Teardown(ctx context.Context, outputs engine.Outputs) error {
 		return fmt.Errorf("%s: teardown: missing tofu work dir in outputs", p.cfg.ProviderName)
 	}
 	if _, err := os.Stat(filepath.Join(workDir, ".terraform")); os.IsNotExist(err) {
-		fmt.Fprintf(p.out, "==> %s: init (provider cache missing, re-initializing)\n", p.cfg.ProviderName)
+		consolelog.Println(p.out, fmt.Sprintf("%s: init (provider cache missing, re-initializing)", p.cfg.ProviderName))
 		if err := p.runTofu(ctx, workDir, "init", "-input=false"); err != nil {
 			return fmt.Errorf("%s: tofu init: %w", p.cfg.ProviderName, err)
 		}
 	}
-	fmt.Fprintf(p.out, "==> %s: tofu destroy\n", p.cfg.ProviderName)
+	consolelog.Println(p.out, fmt.Sprintf("%s: tofu destroy", p.cfg.ProviderName))
 	if err := p.runTofu(ctx, workDir, "destroy", "-auto-approve", "-input=false"); err != nil {
 		return fmt.Errorf("%s: tofu destroy: %w", p.cfg.ProviderName, err)
 	}
@@ -247,13 +248,13 @@ func (p *Provider) Bootstrap(ctx context.Context, req engine.BootstrapRequest) e
 	target := fmt.Sprintf("%s@%s", sshUser, ip)
 
 	// Wait for sshd; the instance exists in the cloud but needs time to boot.
-	fmt.Fprintf(p.out, "==> %s: bootstrap: waiting for SSH on %s\n", p.cfg.ProviderName, ip)
+	consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: waiting for SSH on %s", p.cfg.ProviderName, ip))
 	if err := waitForSSH(ctx, ip, 2*time.Minute); err != nil {
 		return fmt.Errorf("%s: bootstrap: wait for SSH: %w", p.cfg.ProviderName, err)
 	}
 
 	// Wait for cloud-init to finish so startup-script tools (go-tpc, etc.) are ready.
-	fmt.Fprintf(p.out, "==> %s: bootstrap: waiting for cloud-init to complete\n", p.cfg.ProviderName)
+	consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: waiting for cloud-init to complete", p.cfg.ProviderName))
 	cloudInitCtx, cancelCloudInit := context.WithTimeout(ctx, cloudInitTimeout)
 	err = p.ssh(cloudInitCtx, keyPath, target, "cloud-init status --wait")
 	timedOut := cloudInitCtx.Err() == context.DeadlineExceeded
@@ -265,7 +266,7 @@ func (p *Provider) Bootstrap(ctx context.Context, req engine.BootstrapRequest) e
 		return fmt.Errorf("%s: bootstrap: cloud-init wait: %w", p.cfg.ProviderName, err)
 	}
 
-	fmt.Fprintf(p.out, "==> %s: bootstrap: preparing remote directory\n", p.cfg.ProviderName)
+	consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: preparing remote directory", p.cfg.ProviderName))
 	if err := p.ssh(ctx, keyPath, target, "mkdir -p "+remoteDir); err != nil {
 		return fmt.Errorf("%s: bootstrap: mkdir: %w", p.cfg.ProviderName, err)
 	}
@@ -273,13 +274,13 @@ func (p *Provider) Bootstrap(ctx context.Context, req engine.BootstrapRequest) e
 	switch remoteBinarySource(cfg) {
 	case "fetch":
 		arch := p.targetArch(cfg)
-		fmt.Fprintf(p.out, "==> %s: bootstrap: fetching benchctl %s release binary on remote (%s)\n", p.cfg.ProviderName, buildinfo.Version, arch)
+		consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: fetching benchctl %s release binary on remote (%s)", p.cfg.ProviderName, buildinfo.Version, arch))
 		if err := p.fetchReleaseBinary(ctx, keyPath, target, arch); err != nil {
 			return fmt.Errorf("%s: bootstrap: fetch benchctl release: %w", p.cfg.ProviderName, err)
 		}
 	default: // "scp"
 		benchctlBin := p.benchctlBinaryPath(cfg)
-		fmt.Fprintf(p.out, "==> %s: bootstrap: SCP benchctl binary\n", p.cfg.ProviderName)
+		consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: SCP benchctl binary", p.cfg.ProviderName))
 		if err := p.scp(ctx, keyPath, benchctlBin, scpHost(target)+":"+remoteBenchctlBin); err != nil {
 			return fmt.Errorf("%s: bootstrap: scp benchctl: %w", p.cfg.ProviderName, err)
 		}
@@ -293,7 +294,7 @@ func (p *Provider) Bootstrap(ctx context.Context, req engine.BootstrapRequest) e
 	if err != nil {
 		return fmt.Errorf("%s: bootstrap: resolve scenario path: %w", p.cfg.ProviderName, err)
 	}
-	fmt.Fprintf(p.out, "==> %s: bootstrap: SCP scenario\n", p.cfg.ProviderName)
+	consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: SCP scenario", p.cfg.ProviderName))
 	if err := p.scp(ctx, keyPath, absScenario, scpHost(target)+":"+remoteScenarioPath); err != nil {
 		return fmt.Errorf("%s: bootstrap: scp scenario: %w", p.cfg.ProviderName, err)
 	}
@@ -313,7 +314,7 @@ func (p *Provider) Bootstrap(ctx context.Context, req engine.BootstrapRequest) e
 			continue
 		}
 		src := filepath.Join(scenarioDir, e.Name())
-		fmt.Fprintf(p.out, "==> %s: bootstrap: SCP scripts %s\n", p.cfg.ProviderName, e.Name())
+		consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: SCP scripts %s", p.cfg.ProviderName, e.Name()))
 		if err := p.scpDir(ctx, keyPath, src, scpHost(target)+":"+remoteDir+"/"); err != nil {
 			return fmt.Errorf("%s: bootstrap: scp scripts %s: %w", p.cfg.ProviderName, e.Name(), err)
 		}
@@ -323,7 +324,7 @@ func (p *Provider) Bootstrap(ctx context.Context, req engine.BootstrapRequest) e
 	// resume` there has nothing to load, since a store that is local to the
 	// orchestrator holds the only copy.
 	if len(req.StateSeed) > 0 {
-		fmt.Fprintf(p.out, "==> %s: bootstrap: seeding run state\n", p.cfg.ProviderName)
+		consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: seeding run state", p.cfg.ProviderName))
 		if err := p.seedState(ctx, keyPath, target, req.StateSeed); err != nil {
 			return fmt.Errorf("%s: bootstrap: seed run state: %w", p.cfg.ProviderName, err)
 		}
@@ -331,12 +332,12 @@ func (p *Provider) Bootstrap(ctx context.Context, req engine.BootstrapRequest) e
 
 	// SSH: start benchctl resume as a detached background process.
 	resumeCmd := buildResumeCmd(p.cfg.Benchctl, driverToken, runID)
-	fmt.Fprintf(p.out, "==> %s: bootstrap: starting benchctl resume\n", p.cfg.ProviderName)
+	consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: starting benchctl resume", p.cfg.ProviderName))
 	if err := p.ssh(ctx, keyPath, target, resumeCmd); err != nil {
 		return fmt.Errorf("%s: bootstrap: resume: %w", p.cfg.ProviderName, err)
 	}
 
-	fmt.Fprintf(p.out, "==> %s: bootstrap complete; resume log at %s:%s\n", p.cfg.ProviderName, ip, remoteResumeLog)
+	consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap complete; resume log at %s:%s", p.cfg.ProviderName, ip, remoteResumeLog))
 	return nil
 }
 
@@ -766,7 +767,7 @@ func (p *Provider) ensureBenchctlBinary(binPath string) error {
 		}
 		return fmt.Errorf("benchctl binary %q not found and no live checkout to build it from", binPath)
 	}
-	fmt.Fprintf(p.out, "==> %s: building %s with: mise run build-linux\n", p.cfg.ProviderName, binPath)
+	consolelog.Println(p.out, fmt.Sprintf("%s: building %s with: mise run build-linux", p.cfg.ProviderName, binPath))
 	// Do NOT use CommandContext: interrupting a build mid-way leaves a broken binary.
 	cmd := exec.Command("mise", "run", "build-linux")
 	cmd.Dir = buildinfo.SourceDir
