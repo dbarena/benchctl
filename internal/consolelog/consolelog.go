@@ -16,9 +16,9 @@ func Timestamp() string {
 	return time.Now().UTC().Format(TimestampLayout)
 }
 
-// Println writes msg to w as a "==> <UTC timestamp> " prefixed line. Callers
+// Println writes msg to w as a "==> <UTC timestamp> - " prefixed line. Callers
 // build msg with fmt.Sprintf (using a literal format string) rather than
 // passing one here, so `go vet`'s printf check still applies to it.
 func Println(w io.Writer, msg string) {
-	fmt.Fprintln(w, "==> "+Timestamp()+" "+msg)
+	fmt.Fprintln(w, "==> "+Timestamp()+" - "+msg)
 }
