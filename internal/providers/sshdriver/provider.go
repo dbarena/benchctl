@@ -26,6 +26,7 @@ import (
 	"github.com/dbarena/benchctl/internal/config"
 	"github.com/dbarena/benchctl/internal/consolelog"
 	"github.com/dbarena/benchctl/internal/engine"
+	"github.com/dbarena/benchctl/internal/hostmetrics"
 	"github.com/dbarena/benchctl/internal/tags"
 	"github.com/dbarena/benchctl/internal/tofustate"
 )
@@ -188,10 +189,12 @@ func (*Provider) Setup(_ context.Context, _ map[string]any, _ engine.Outputs) er
 	return nil
 }
 
-// Collect is a pass-through; metrics are produced in-process on the remote
-// machine and written to the collector directly by `benchctl resume`.
-func (*Provider) Collect(_ context.Context, _ map[string]any, _ engine.Outputs, metrics engine.Metrics) (engine.Metrics, error) {
-	return metrics, nil
+// Collect is otherwise a pass-through -- metrics are produced in-process on
+// the remote machine and written to the collector directly by `benchctl
+// resume` -- aside from folding in any driver-side CPU/network utilization
+// Vector captured (if present) into the result.
+func (p *Provider) Collect(_ context.Context, _ map[string]any, _ engine.Outputs, metrics engine.Metrics) (engine.Metrics, error) {
+	return hostmetrics.AppendTo(metrics, "", p.out), nil
 }
 
 // Teardown runs `tofu destroy` using the work dir stored in outputs.

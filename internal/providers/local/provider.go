@@ -4,8 +4,10 @@ package local
 
 import (
 	"context"
+	"os"
 
 	"github.com/dbarena/benchctl/internal/engine"
+	"github.com/dbarena/benchctl/internal/hostmetrics"
 )
 
 // Provider is a no-op DriverProvider. Provision and Teardown do nothing
@@ -24,11 +26,12 @@ func (*Provider) Setup(_ context.Context, _ map[string]any, _ engine.Outputs) er
 	return nil
 }
 
-// Collect passes workload metrics through unchanged. For the local driver the
-// workload adapter already returned results in-process; there is nothing to
-// gather from a remote machine.
+// Collect passes workload metrics through unchanged, aside from folding in
+// any driver-side CPU/network utilization Vector captured (if present). For
+// the local driver the workload adapter already returned its own results
+// in-process; there is nothing else to gather from a remote machine.
 func (*Provider) Collect(_ context.Context, _ map[string]any, _ engine.Outputs, metrics engine.Metrics) (engine.Metrics, error) {
-	return metrics, nil
+	return hostmetrics.AppendTo(metrics, "", os.Stderr), nil
 }
 
 func (*Provider) Teardown(_ context.Context, _ engine.Outputs) error {
