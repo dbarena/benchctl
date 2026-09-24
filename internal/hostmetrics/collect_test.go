@@ -3,6 +3,7 @@ package hostmetrics
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -46,7 +47,8 @@ func marshalEventLine(t *testing.T, name, ts string, tags map[string]string, val
 }
 
 func TestCollect_MissingFileReturnsNilNil(t *testing.T) {
-	pts, err := Collect(filepath.Join(t.TempDir(), "does-not-exist.log"))
+	var c Cursor
+	pts, err := c.Collect(filepath.Join(t.TempDir(), "does-not-exist.log"))
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
 	}
@@ -74,7 +76,8 @@ func TestCollect_EndToEnd(t *testing.T) {
 	add(metricNetworkReceiveBytesTotal, t0, map[string]string{"device": "eth0"}, 0)
 	add(metricNetworkReceiveBytesTotal, t1, map[string]string{"device": "eth0"}, 100)
 
-	points, err := Collect(writeTempLog(t, lines))
+	var c Cursor
+	points, err := c.Collect(writeTempLog(t, lines))
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
 	}
@@ -123,8 +126,9 @@ func TestAppendTo_AppendsToExistingStructuredMetrics(t *testing.T) {
 		engine.StructuredKey: engine.StructuredMetrics{Points: []engine.MetricPoint{existing}},
 	}
 
+	var c Cursor
 	var warnBuf bytes.Buffer
-	got := AppendTo(metrics, path, &warnBuf)
+	got := c.AppendTo(metrics, path, &warnBuf)
 
 	sm, ok := got[engine.StructuredKey].(engine.StructuredMetrics)
 	if !ok {
@@ -143,8 +147,9 @@ func TestAppendTo_AppendsToExistingStructuredMetrics(t *testing.T) {
 
 func TestAppendTo_MissingFileLeavesMetricsUnchanged(t *testing.T) {
 	metrics := engine.Metrics{"foo": "bar"}
+	var c Cursor
 	var warnBuf bytes.Buffer
-	got := AppendTo(metrics, filepath.Join(t.TempDir(), "missing.log"), &warnBuf)
+	got := c.AppendTo(metrics, filepath.Join(t.TempDir(), "missing.log"), &warnBuf)
 	if len(got) != 1 || got["foo"] != "bar" {
 		t.Errorf("metrics changed unexpectedly: %+v", got)
 	}
@@ -156,12 +161,81 @@ func TestAppendTo_MissingFileLeavesMetricsUnchanged(t *testing.T) {
 func TestAppendTo_ErrorLogsWarningAndLeavesMetricsUnchanged(t *testing.T) {
 	dirPath := t.TempDir() // a directory: os.Open succeeds, Read fails, surfacing a parse error.
 	metrics := engine.Metrics{"foo": "bar"}
+	var c Cursor
 	var warnBuf bytes.Buffer
-	got := AppendTo(metrics, dirPath, &warnBuf)
+	got := c.AppendTo(metrics, dirPath, &warnBuf)
 	if len(got) != 1 || got["foo"] != "bar" {
 		t.Errorf("metrics changed unexpectedly: %+v", got)
 	}
 	if warnBuf.Len() == 0 {
 		t.Error("expected a warning to be logged")
+	}
+}
+
+// TestCursor_SecondCallOnlySeesSamplesSinceThePrevious is the crux of why
+// Cursor exists: Driver.Collect fires once per benchmark entry per fixture
+// per iteration, all against the same ever-growing Vector log. Without a
+// watermark, a second fixture's numbers would be diluted by the first
+// fixture's activity too, instead of reflecting only its own window.
+func TestCursor_SecondCallOnlySeesSamplesSinceThePrevious(t *testing.T) {
+	const t0, t1, t2, t3 = "2026-01-01T00:00:00Z", "2026-01-01T00:00:02Z", "2026-01-01T00:00:04Z", "2026-01-01T00:00:06Z"
+
+	// Fixture 1's window: [t0,t1], idle+1/user+1 over 2s -> 50% util.
+	fixture1 := []string{
+		marshalEventLine(t, metricCPUSecondsTotal, t0, map[string]string{"cpu": "0", "mode": "idle"}, 0),
+		marshalEventLine(t, metricCPUSecondsTotal, t0, map[string]string{"cpu": "0", "mode": "user"}, 0),
+		marshalEventLine(t, metricCPUSecondsTotal, t1, map[string]string{"cpu": "0", "mode": "idle"}, 1),
+		marshalEventLine(t, metricCPUSecondsTotal, t1, map[string]string{"cpu": "0", "mode": "user"}, 1),
+	}
+	// Fixture 2's window: [t2,t3], idle+0/user+2 over 2s -> 100% util. Appended
+	// to the same file, as Vector would do across fixtures within one run.
+	fixture2 := []string{
+		marshalEventLine(t, metricCPUSecondsTotal, t2, map[string]string{"cpu": "0", "mode": "idle"}, 1),
+		marshalEventLine(t, metricCPUSecondsTotal, t2, map[string]string{"cpu": "0", "mode": "user"}, 1),
+		marshalEventLine(t, metricCPUSecondsTotal, t3, map[string]string{"cpu": "0", "mode": "idle"}, 1),
+		marshalEventLine(t, metricCPUSecondsTotal, t3, map[string]string{"cpu": "0", "mode": "user"}, 3),
+	}
+
+	path := writeTempLog(t, fixture1)
+	var c Cursor
+
+	pts1, err := c.Collect(path)
+	if err != nil {
+		t.Fatalf("Collect (fixture 1): %v", err)
+	}
+	if got := utilizationP99(pts1); got != 0.5 {
+		t.Fatalf("fixture 1 p99 utilization = %v, want 0.5", got)
+	}
+
+	appendToTempLog(t, path, fixture2)
+	pts2, err := c.Collect(path)
+	if err != nil {
+		t.Fatalf("Collect (fixture 2): %v", err)
+	}
+	// Without the watermark, this would see all of fixture1+fixture2's
+	// samples and report a p99 blended across both windows instead of 1.0.
+	if got := utilizationP99(pts2); got != 1.0 {
+		t.Fatalf("fixture 2 p99 utilization = %v, want 1.0 (isolated from fixture 1)", got)
+	}
+}
+
+func utilizationP99(points []engine.MetricPoint) float64 {
+	for _, p := range points {
+		if p.Family == "driver_cpu_utilization" && p.Labels["quantile"] == "0.99" {
+			return p.Value
+		}
+	}
+	return math.NaN()
+}
+
+func appendToTempLog(t *testing.T, path string, lines []string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open temp log for append: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
+		t.Fatalf("append temp log: %v", err)
 	}
 }

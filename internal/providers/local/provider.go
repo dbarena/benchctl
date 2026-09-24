@@ -12,7 +12,9 @@ import (
 
 // Provider is a no-op DriverProvider. Provision and Teardown do nothing
 // because the driver is simply the local process running benchctl.
-type Provider struct{}
+type Provider struct {
+	hostMetrics hostmetrics.Cursor
+}
 
 func New() *Provider { return &Provider{} }
 
@@ -30,8 +32,8 @@ func (*Provider) Setup(_ context.Context, _ map[string]any, _ engine.Outputs) er
 // any driver-side CPU/network utilization Vector captured (if present). For
 // the local driver the workload adapter already returned its own results
 // in-process; there is nothing else to gather from a remote machine.
-func (*Provider) Collect(_ context.Context, _ map[string]any, _ engine.Outputs, metrics engine.Metrics) (engine.Metrics, error) {
-	return hostmetrics.AppendTo(metrics, "", os.Stderr), nil
+func (p *Provider) Collect(_ context.Context, _ map[string]any, _ engine.Outputs, metrics engine.Metrics) (engine.Metrics, error) {
+	return p.hostMetrics.AppendTo(metrics, "", os.Stderr), nil
 }
 
 func (*Provider) Teardown(_ context.Context, _ engine.Outputs) error {
