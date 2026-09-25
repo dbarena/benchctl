@@ -3,7 +3,9 @@ package opentofu
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -109,6 +111,81 @@ func TestProvision_ReadOutputsFailsAfterApply_ReturnsWorkDirForTeardown(t *testi
 	// tfstate must remain on disk for a later `benchctl teardown` to use.
 	if _, statErr := os.Stat(workDir); statErr != nil {
 		t.Errorf("workdir %s: want present for later teardown, stat err = %v", workDir, statErr)
+	}
+}
+
+// TestProvision_WritesTFVarsBeforePreApply is the regression test for the
+// bug where `tofu import` calls made from a PreApplyFunc (e.g.
+// gcpcloudsql.PreApply) failed with "No value for required variable" for
+// vars with no default (e.g. disk_size_gb): terraform.tfvars.json was
+// written only after preApply ran, so preApply's own `tofu` invocations
+// couldn't see it.
+func TestProvision_WritesTFVarsBeforePreApply(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	installFakeTofu(t, nil)
+
+	moduleDir := filepath.Join(tmp, "module")
+	if err := os.MkdirAll(moduleDir, 0o755); err != nil {
+		t.Fatalf("mkdir module dir: %v", err)
+	}
+
+	const runID = "test-run-20260101-000000-abcdef"
+	var sawTFVarsBeforeImport bool
+	preApply := func(ctx context.Context, out io.Writer, run RunFunc, cfg, vars map[string]any) (map[string]any, error) {
+		workDir := deriveWorkDir(runID, moduleDir)
+		data, err := os.ReadFile(filepath.Join(workDir, "terraform.tfvars.json"))
+		if err != nil {
+			t.Errorf("preApply: read terraform.tfvars.json before running tofu import: %v", err)
+			return vars, nil
+		}
+		var written map[string]any
+		if err := json.Unmarshal(data, &written); err != nil {
+			t.Errorf("preApply: unmarshal terraform.tfvars.json: %v", err)
+			return vars, nil
+		}
+		if written["disk_size_gb"] != float64(256) {
+			t.Errorf("preApply: terraform.tfvars.json disk_size_gb = %v, want 256", written["disk_size_gb"])
+		}
+		sawTFVarsBeforeImport = true
+		if err := run(ctx, "import", "-input=false", "google_compute_network.this", "shared-net"); err != nil {
+			t.Errorf("preApply: run tofu import: %v", err)
+		}
+		vars["wait_for_peering_propagation"] = false
+		return vars, nil
+	}
+
+	p := New(preApply, &config.Config{})
+	p.out = &bytes.Buffer{}
+
+	outputs, err := p.Provision(context.Background(), runID, map[string]any{
+		"module": moduleDir,
+		"vars":   map[string]any{"disk_size_gb": 256},
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if outputs == nil {
+		t.Fatal("Provision: want non-nil outputs")
+	}
+	if !sawTFVarsBeforeImport {
+		t.Fatal("preApply never ran")
+	}
+
+	workDir := deriveWorkDir(runID, moduleDir)
+	data, err := os.ReadFile(filepath.Join(workDir, "terraform.tfvars.json"))
+	if err != nil {
+		t.Fatalf("read terraform.tfvars.json after preApply: %v", err)
+	}
+	var final map[string]any
+	if err := json.Unmarshal(data, &final); err != nil {
+		t.Fatalf("unmarshal terraform.tfvars.json: %v", err)
+	}
+	if final["disk_size_gb"] != float64(256) {
+		t.Errorf("final terraform.tfvars.json disk_size_gb = %v, want 256", final["disk_size_gb"])
+	}
+	if final["wait_for_peering_propagation"] != false {
+		t.Errorf("final terraform.tfvars.json wait_for_peering_propagation = %v, want false (added by preApply)", final["wait_for_peering_propagation"])
 	}
 }
 
