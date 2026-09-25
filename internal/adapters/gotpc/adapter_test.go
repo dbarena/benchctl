@@ -313,6 +313,44 @@ func TestVersionInfo_Failure(t *testing.T) {
 	}
 }
 
+// ---- tailBuffer tests ----
+
+func TestTailBuffer_UnderCap_ReturnsVerbatim(t *testing.T) {
+	tb := &tailBuffer{}
+	if _, err := tb.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if got := string(tb.Bytes()); got != "hello" {
+		t.Errorf("Bytes() = %q, want %q", got, "hello")
+	}
+}
+
+func TestTailBuffer_OverCap_KeepsOnlyTheTail(t *testing.T) {
+	tb := &tailBuffer{}
+	// Write well past maxTailBytes, in chunks, as execRun's io.MultiWriter would.
+	chunk := strings.Repeat("a", 1024)
+	var want strings.Builder
+	for i := 0; i < 100; i++ {
+		if _, err := tb.Write([]byte(chunk)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		want.WriteString(chunk)
+	}
+
+	got := tb.Bytes()
+	if len(got) > maxTailBytes+len("...[truncated]...\n") {
+		t.Errorf("Bytes() length = %d, want at most %d", len(got), maxTailBytes+len("...[truncated]...\n"))
+	}
+	if !strings.HasPrefix(string(got), "...[truncated]...\n") {
+		t.Errorf("Bytes() = %q, want truncation marker prefix", string(got))
+	}
+	wantTail := want.String()
+	wantTail = wantTail[len(wantTail)-maxTailBytes:]
+	if !strings.HasSuffix(string(got), wantTail) {
+		t.Error("Bytes() does not end with the actual tail of what was written")
+	}
+}
+
 // ---- helpers ----
 
 // assertFlag checks that args contains the two-token sequence [flag, value].
