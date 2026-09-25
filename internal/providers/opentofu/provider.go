@@ -91,19 +91,28 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 		return nil, fmt.Errorf("opentofu: init: %w", err)
 	}
 
+	// Persist vars to terraform.tfvars.json so `tofu destroy` picks them up
+	// automatically; required variables with no default would otherwise fail
+	// teardown when no -var flags are passed. This must happen before
+	// preApply: preApply implementations (e.g. gcpcloudsql) shell out to
+	// `tofu import`, which validates every declared variable in the module
+	// just like apply does, so required vars with no default (e.g. this
+	// module's disk_size_gb) must already be on disk or the import fails.
+	if err := writeTFVars(workDir, vars); err != nil {
+		return nil, fmt.Errorf("opentofu: write tfvars: %w", err)
+	}
+
 	if p.preApply != nil {
 		runTofu := func(ctx context.Context, args ...string) error { return p.run(ctx, workDir, "tofu", args...) }
 		vars, err = p.preApply(ctx, p.out, runTofu, cfg, vars)
 		if err != nil {
 			return nil, fmt.Errorf("opentofu: pre-apply: %w", err)
 		}
-	}
-
-	// Persist vars to terraform.tfvars.json so `tofu destroy` picks them up
-	// automatically; required variables with no default would otherwise fail
-	// teardown when no -var flags are passed.
-	if err := writeTFVars(workDir, vars); err != nil {
-		return nil, fmt.Errorf("opentofu: write tfvars: %w", err)
+		// preApply may have added or changed vars (e.g.
+		// wait_for_peering_propagation), so rewrite tfvars before apply runs.
+		if err := writeTFVars(workDir, vars); err != nil {
+			return nil, fmt.Errorf("opentofu: write tfvars: %w", err)
+		}
 	}
 
 	absWorkDir, err := filepath.Abs(workDir)
