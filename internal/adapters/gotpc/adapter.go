@@ -3,7 +3,6 @@
 package gotpc
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -18,7 +17,8 @@ import (
 )
 
 // cmdRunner executes a command, tees combined output to out (if non-nil),
-// and returns the captured bytes for error reporting.
+// and returns a bounded tail of the output for error reporting. The full
+// output is never buffered in memory (see tailBuffer).
 type cmdRunner func(ctx context.Context, out io.Writer, name string, args ...string) ([]byte, error)
 
 // toolEnsurer resolves the path to a required binary, failing if it's missing.
@@ -89,7 +89,6 @@ func (a *Adapter) Run(ctx context.Context, outputs engine.Outputs, step schema.S
 	if err != nil {
 		return nil, fmt.Errorf("go-tpc run: %w", err)
 	}
-	metrics["raw_output"] = string(out)
 	removeScratchFile(a.out, summaryFile)
 
 	data, err := os.ReadFile(rawSamplesFile)
@@ -245,14 +244,44 @@ func buildCmd(outputs engine.Outputs, step schema.SuiteStep) (name string, args 
 
 func execRun(ctx context.Context, out io.Writer, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	var buf bytes.Buffer
-	w := io.Writer(&buf)
+	tail := &tailBuffer{}
+	w := io.Writer(tail)
 	if out != nil && out != io.Discard {
 		fmt.Fprintf(out, "$ %s %s\n", name, strings.Join(args, " "))
-		w = io.MultiWriter(out, &buf)
+		w = io.MultiWriter(out, tail)
 	}
 	cmd.Stdout = w
 	cmd.Stderr = w
 	err := cmd.Run()
-	return buf.Bytes(), err
+	return tail.Bytes(), err
+}
+
+// maxTailBytes bounds how much subprocess output execRun keeps in memory, for
+// the error message wrapped around a failed command. This ensures that a runaway
+// subprocess cannot grow this process's own memory without limit.
+const maxTailBytes = 64 * 1024
+
+// tailBuffer is an io.Writer that retains only the last maxTailBytes written
+// to it.
+type tailBuffer struct {
+	buf       []byte
+	truncated bool
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > maxTailBytes {
+		trimmed := make([]byte, maxTailBytes)
+		copy(trimmed, t.buf[len(t.buf)-maxTailBytes:])
+		t.buf = trimmed
+		t.truncated = true
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) Bytes() []byte {
+	if t.truncated {
+		return append([]byte("...[truncated]...\n"), t.buf...)
+	}
+	return t.buf
 }

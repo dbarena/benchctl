@@ -122,9 +122,8 @@ func TestRun_ReadsBackItsOwnGeneratedSummaryFile(t *testing.T) {
 	if v, ok := findPoint(metrics, "tpcc_tpm", map[string]string{"transaction": "NEW_ORDER", "status": "ok"}); !ok || v != 258.1 {
 		t.Errorf("tpcc_tpm NEW_ORDER/ok = %v (ok=%v), want 258.1", v, ok)
 	}
-	raw, ok := metrics["raw_output"].(string)
-	if !ok || raw == "" {
-		t.Error("raw_output should still be populated from stdout")
+	if _, ok := metrics["raw_output"]; ok {
+		t.Error("raw_output should not be populated: no collector consumes it")
 	}
 }
 
