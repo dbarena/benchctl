@@ -85,23 +85,17 @@ Follow these steps to create or switch to a new Supabase project as the state st
 
 1. Create a new Supabase project dedicated to benchctl (keep operational state isolated from application projects).
 
-2. Apply migrations:
+2. Apply the migration:
 
    ```bash
    DB_URL="postgresql://postgres.{project-ref}@{pooler-host}:{port}/postgres"
 
-   PGPASSWORD=<db-password> psql "$DB_URL" -f migrations/001_create_runs.sql
-   PGPASSWORD=<db-password> psql "$DB_URL" -f migrations/002_phase4.sql
-   PGPASSWORD=<db-password> psql "$DB_URL" -f migrations/003_perfeng11.sql
-   PGPASSWORD=<db-password> psql "$DB_URL" -f migrations/004_perfeng25.sql
-   PGPASSWORD=<db-password> psql "$DB_URL" -f migrations/005_perfeng29.sql
-   PGPASSWORD=<db-password> psql "$DB_URL" -f migrations/006_current_step_tracking.sql
-   PGPASSWORD=<db-password> psql "$DB_URL" -f migrations/007_created_by_email.sql
+   PGPASSWORD=<db-password> psql "$DB_URL" -f migrations/001_init.sql
    ```
 
    The connection string and database password are in **Project Settings → Database**.
 
-3. After each migration, reload the PostgREST schema cache so new columns become visible immediately:
+3. After applying the migration, reload the PostgREST schema cache so the new columns become visible immediately:
 
    ```bash
    PGPASSWORD=<db-password> psql "$DB_URL" -c "NOTIFY pgrst, 'reload schema'"
@@ -109,10 +103,4 @@ Follow these steps to create or switch to a new Supabase project as the state st
 
 | Migration | What it does |
 |---|---|
-| `001_create_runs.sql` | Creates the `runs` table with base columns and enables RLS |
-| `002_phase4.sql` | Adds `created_by` and `last_heartbeat` columns; ownership-scoped RLS |
-| `003_perfeng11.sql` | Adds `terminated_at` to track successful teardown |
-| `004_perfeng25.sql` | Adds `metadata` JSONB column (scenario labels, metadata step results, collector config) |
-| `005_perfeng29.sql` | Adds `tofu_state` column to store OpenTofu working directory as a compressed blob |
-| `006_current_step_tracking.sql` | Adds `current_fixture`, `current_iteration`, `current_step`, `step_started_at` columns to track the suite step currently executing |
-| `007_created_by_email.sql` | Adds `created_by_email` so `benchctl status` can show who started a run without an admin API lookup |
+| `001_init.sql` | Creates the `runs` table with the full column set, enables RLS, and adds ownership-scoped insert/update/delete policies |
