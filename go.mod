@@ -5,12 +5,12 @@ module github.com/dbarena/benchctl
 // single source of truth: mise reads it from here (see mise.toml).
 //
 // Two rules when bumping Go:
-//   1. `toolchain` must be fully qualified (go1.26.1, not go1.26). mise silently
+//   1. `toolchain` must be fully qualified (go1.27.1, not go1.27). mise silently
 //      reads no version at all from a short form, and CI then picks its own Go.
 //   2. `toolchain` must stay above the `go` directive, or `go mod tidy` deletes it.
-go 1.26.0
+go 1.27.0
 
-toolchain go1.26.1
+toolchain go1.27.1
 
 require (
 	github.com/fatih/color v1.19.0
