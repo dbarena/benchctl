@@ -16,6 +16,7 @@ package diagnostics
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -65,6 +66,18 @@ type Request struct {
 	Windows []Window
 	// Dest is the diagnostics directory, already created.
 	Dest string
+	// Progress, when set, reports what a collector is working on. Collection
+	// runs for tens of seconds against a dozen APIs, and silence for that
+	// long is indistinguishable from a hang.
+	Progress func(format string, args ...any)
+}
+
+// Reportf reports progress when the caller asked for it, and is a no-op
+// otherwise so collectors need no nil checks.
+func (r Request) Reportf(format string, args ...any) {
+	if r.Progress != nil {
+		r.Progress(format, args...)
+	}
 }
 
 // WindowDir returns the subdirectory of Dest that w's artifacts belong in,
@@ -77,6 +90,51 @@ func (r Request) WindowDir(w Window) (string, error) {
 	}
 	return dir, nil
 }
+
+// Span is the interval covering every window. Sources that are not usefully
+// sliced per step, such as a Postgres log or an instance's event history,
+// read better as one continuous record.
+func (r Request) Span() (start, end time.Time) {
+	for i, w := range r.Windows {
+		if i == 0 || w.Start.Before(start) {
+			start = w.Start
+		}
+		if i == 0 || w.End.After(end) {
+			end = w.End
+		}
+	}
+	return start, end
+}
+
+// Save writes one artifact into dir and records it on res, or records why it
+// could not. Every collection step funnels through here so no failure is
+// silent. Reports whether the artifact was written.
+func (r Request) Save(res *Result, dir, name, command string, data []byte, err error) bool {
+	rel := r.rel(filepath.Join(dir, name))
+	if err != nil {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", rel, err))
+		return false
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("write %s: %v", rel, err))
+		return false
+	}
+	res.Artifacts = append(res.Artifacts, Artifact{File: rel, Command: command})
+	return true
+}
+
+// rel renders a path relative to Dest for the index, falling back to the
+// absolute path: an ugly entry beats losing the record of a file that exists.
+func (r Request) rel(path string) string {
+	out, err := filepath.Rel(r.Dest, path)
+	if err != nil {
+		return path
+	}
+	return out
+}
+
+// RFC3339 is the timestamp format the AWS and Google APIs accept.
+func RFC3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
 // Artifact is one collected file and the command or URL that produced it, so
 // a reader can tell what was asked for and reproduce it.

@@ -9,6 +9,7 @@ import (
 	"github.com/dbarena/benchctl/internal/config"
 	"github.com/dbarena/benchctl/internal/diagnostics"
 	awsdiag "github.com/dbarena/benchctl/internal/diagnostics/aws"
+	gcpdiag "github.com/dbarena/benchctl/internal/diagnostics/gcp"
 	"github.com/dbarena/benchctl/internal/engine"
 	"github.com/dbarena/benchctl/internal/runstate"
 )
@@ -22,7 +23,9 @@ func buildDiagnosticsCollector(cfg *config.Config, vendor string) (diagnostics.C
 		return nil, nil
 	case diagnostics.VendorAWS:
 		return awsdiag.New(cfg), nil
-	case diagnostics.VendorGCP, diagnostics.VendorSupabase:
+	case diagnostics.VendorGCP:
+		return gcpdiag.New(cfg), nil
+	case diagnostics.VendorSupabase:
 		// Implementations land one vendor at a time.
 		return nil, nil
 	default:
@@ -64,6 +67,7 @@ func collectDiagnostics(ctx context.Context, state *runstate.State, dest string)
 	}
 
 	diagDir := filepath.Join(dest, diagnostics.DirName)
+	fmt.Fprintf(os.Stderr, "Collecting %s diagnostics over %d window(s); this queries several APIs and takes a while\n", vendor, len(windows))
 	idx, err := diagnostics.Run(ctx, os.Stderr, collector, diagnostics.Request{
 		RunID:   state.RunID,
 		Outputs: state.TargetOutputs,

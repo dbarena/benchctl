@@ -72,8 +72,8 @@ func (c *Collector) piArgs(op string, w diagnostics.Window) []string {
 		"pi", op,
 		"--service-type", "RDS",
 		"--identifier", c.resourceID,
-		"--start-time", rfc3339(w.Start),
-		"--end-time", rfc3339(w.End),
+		"--start-time", diagnostics.RFC3339(w.Start),
+		"--end-time", diagnostics.RFC3339(w.End),
 	}
 }
 
@@ -91,7 +91,7 @@ func (c *Collector) collectPILoad(ctx context.Context, req diagnostics.Request, 
 	}}
 	payload, err := json.Marshal(query)
 	if err != nil {
-		c.save(res, req, dir, "pi_db_load.json", "", nil, err)
+		req.Save(res, dir, "pi_db_load.json", "", nil, err)
 		return
 	}
 	args := append(c.piArgs("get-resource-metrics", w),
@@ -102,7 +102,7 @@ func (c *Collector) collectPILoad(ctx context.Context, req diagnostics.Request, 
 		"--period-alignment", "START_TIME",
 	)
 	out, argv, err := c.run(ctx, args...)
-	c.save(res, req, dir, "pi_db_load.json", argv, out, err)
+	req.Save(res, dir, "pi_db_load.json", argv, out, err)
 }
 
 // collectPITopSQL ranks SQL digests by load, with call rate and latency.
@@ -117,7 +117,7 @@ func (c *Collector) collectPITopSQL(ctx context.Context, req diagnostics.Request
 		Limit:      piTopN,
 	})
 	if err != nil {
-		c.save(res, req, dir, "pi_top_sql.json", "", nil, err)
+		req.Save(res, dir, "pi_top_sql.json", "", nil, err)
 		return
 	}
 	args := append(c.piArgs("describe-dimension-keys", w),
@@ -132,7 +132,7 @@ func (c *Collector) collectPITopSQL(ctx context.Context, req diagnostics.Request
 		"--max-results", strconv.Itoa(piTopN),
 	)
 	out, argv, err := c.run(ctx, args...)
-	c.save(res, req, dir, "pi_top_sql.json", argv, out, err)
+	req.Save(res, dir, "pi_top_sql.json", argv, out, err)
 }
 
 // collectPICounters captures counter metrics, batched to the API's
@@ -146,7 +146,7 @@ func (c *Collector) collectPICounters(ctx context.Context, req diagnostics.Reque
 		payload, err := json.Marshal(queries)
 		name := fmt.Sprintf("pi_counters_%d.json", i+1)
 		if err != nil {
-			c.save(res, req, dir, name, "", nil, err)
+			req.Save(res, dir, name, "", nil, err)
 			continue
 		}
 		args := append(c.piArgs("get-resource-metrics", w),
@@ -155,7 +155,7 @@ func (c *Collector) collectPICounters(ctx context.Context, req diagnostics.Reque
 			"--period-alignment", "START_TIME",
 		)
 		out, argv, err := c.run(ctx, args...)
-		c.save(res, req, dir, name, argv, out, err)
+		req.Save(res, dir, name, argv, out, err)
 	}
 }
 
@@ -163,7 +163,7 @@ func (c *Collector) collectPICounters(ctx context.Context, req diagnostics.Reque
 // top-SQL artifact can be told apart from a disabled one.
 func (c *Collector) collectPIMetadata(ctx context.Context, req diagnostics.Request, res *diagnostics.Result) {
 	out, argv, err := c.run(ctx, "pi", "get-resource-metadata", "--service-type", "RDS", "--identifier", c.resourceID)
-	c.save(res, req, req.Dest, "pi_resource_metadata.json", argv, out, err)
+	req.Save(res, req.Dest, "pi_resource_metadata.json", argv, out, err)
 }
 
 func chunk(s []string, size int) [][]string {

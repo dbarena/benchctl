@@ -45,33 +45,33 @@ func logGroupName(instanceID string) string {
 //
 // The raw API response is deliberately not kept as it would double fetch size
 // without providing additional value.
-func (c *Collector) collectLog(ctx context.Context, req diagnostics.Request, s span, res *diagnostics.Result) {
+func (c *Collector) collectLog(ctx context.Context, req diagnostics.Request, start, end time.Time, res *diagnostics.Result) {
 	out, argv, err := c.run(ctx,
 		"logs", "filter-log-events",
 		"--log-group-name", logGroupName(c.instanceID),
 		// Milliseconds. logs start-query takes seconds; confusing the two
 		// returns zero rows with no error.
-		"--start-time", strconv.FormatInt(s.start.UnixMilli(), 10),
-		"--end-time", strconv.FormatInt(s.end.UnixMilli(), 10),
+		"--start-time", strconv.FormatInt(start.UnixMilli(), 10),
+		"--end-time", strconv.FormatInt(end.UnixMilli(), 10),
 		"--max-items", strconv.Itoa(maxLogEvents),
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "ResourceNotFoundException") {
 			err = fmt.Errorf("log group %s does not exist; the instance was provisioned without enabled_cloudwatch_logs_exports", logGroupName(c.instanceID))
 		}
-		c.save(res, req, req.Dest, "postgresql.log", argv, nil, err)
+		req.Save(res, req.Dest, "postgresql.log", argv, nil, err)
 		return
 	}
 
 	text, notes, err := renderLogEvents(out)
 	if err != nil {
-		c.save(res, req, req.Dest, "postgresql.log", argv, nil, err)
+		req.Save(res, req.Dest, "postgresql.log", argv, nil, err)
 		return
 	}
 	for _, n := range notes {
 		res.Warnings = append(res.Warnings, "postgresql.log: "+n)
 	}
-	c.save(res, req, req.Dest, "postgresql.log", argv, []byte(text), nil)
+	req.Save(res, req.Dest, "postgresql.log", argv, []byte(text), nil)
 }
 
 // renderLogEvents turns a filter-log-events response into text, sorted by

@@ -24,6 +24,12 @@ linters:
         linters: [forbidigo]
       - path: 'internal/providers/gcpcloudsql/network\.go'
         linters: [forbidigo]
+      # Reads GOOGLE_APPLICATION_CREDENTIALS and CLOUDSDK_CONFIG to find the
+      # application default credentials, the same way Google's own client
+      # libraries do. These are Google SDK variables, not benchctl settings,
+      # so internal/config is the wrong home for them.
+      - path: 'internal/diagnostics/gcp/client\.go'
+        linters: [forbidigo]
       - path: '_test\.go$'
         linters: [forbidigo]
 

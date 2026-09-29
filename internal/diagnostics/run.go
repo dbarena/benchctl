@@ -52,6 +52,12 @@ func Run(ctx context.Context, out io.Writer, c Collector, req Request) (Index, e
 		return idx, fmt.Errorf("create diagnostics directory %s: %w", req.Dest, err)
 	}
 
+	if req.Progress == nil && out != nil {
+		req.Progress = func(format string, args ...any) {
+			fmt.Fprintf(out, "  "+c.Name()+": "+format+"\n", args...)
+		}
+	}
+
 	if pf, ok := c.(Preflight); ok {
 		if err := pf.Preflight(req); err != nil {
 			idx.Warnings = append(idx.Warnings, "preflight: "+err.Error())
