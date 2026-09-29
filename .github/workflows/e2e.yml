@@ -25,10 +25,10 @@ jobs:
 
       - uses: ./.github/actions/go-setup
 
+      # Started without waiting so VictoriaMetrics boots while Go compiles; the health
+      # gate below runs just before the first step that actually needs it.
       - name: Start observability stack
-        run: |
-          mise run observability-up
-          until curl -sf http://127.0.0.1:8428/health; do sleep 1; done
+        run: mise run observability-up-metrics
 
       - name: Install go-tpc
         run: mise run install-go-tpc
@@ -36,12 +36,15 @@ jobs:
       - name: Build benchctl
         run: mise build
 
+      - name: Wait for VictoriaMetrics
+        run: until curl -sf http://127.0.0.1:8428/health; do sleep 1; done
+
       - name: Run local scenario
         run: |
           ./benchctl run scenarios/postgres-tpcc-local.yaml \
             --set warehouses=1 \
             --set client_threads=2 \
-            --set duration=30s \
+            --set duration=15s \
             --set collector=victoriametrics
         env:
           BENCHCTL_METRICS_ENDPOINT: http://127.0.0.1:8428
@@ -52,12 +55,12 @@ jobs:
       - name: Verify results
         run: |
           RUN_ID=$(./benchctl status -a | awk 'NR==2 {print $1}')
-          # Poll until VM flushes in-memory data (inmemoryDataFlushInterval default: 5s).
-          # Try first, then sleep, so an already-flushed run costs nothing.
-          for i in {1..12}; do
+          # Poll until VM makes the samples queryable (-search.latencyOffset, set to 1s
+          # in deployments/local/observability.yml). Try first, then sleep.
+          for i in {1..30}; do
             OUTPUT=$(./benchctl results "$RUN_ID" 2>&1) && break
             echo "Attempt $i: metrics not yet available, retrying..."
-            sleep 5
+            sleep 2
           done
           echo "$OUTPUT"
           echo "$OUTPUT" | grep -q "service:"

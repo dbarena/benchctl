@@ -23,7 +23,7 @@ jobs:
 
       - name: Start observability stack
         run: |
-          mise run observability-up
+          mise run observability-up-metrics
           until curl -sf http://127.0.0.1:8428/health; do sleep 1; done
 
       - name: Stage embed

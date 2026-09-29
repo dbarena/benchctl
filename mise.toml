@@ -119,6 +119,10 @@ docker compose -f deployments/local/observability.yml up -d
 echo "Connect to Grafana at http://localhost:3000/login (user: admin, password: admin)"
 """
 
+[tasks.observability-up-metrics]
+description = "Start only VictoriaMetrics (no Grafana) - used by CI, which never opens the UI"
+run = "docker compose -f deployments/local/observability.yml up -d victoriametrics"
+
 [tasks.observability-down]
 description = "Stop local VictoriaMetrics + Grafana stack (preserves data volume)"
 run = "docker compose -f deployments/local/observability.yml down"
