@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -750,12 +751,33 @@ func testProvisionConfig() map[string]any {
 	}
 }
 
+// waitTimeout and waitInterval drive the two waitForProject timeout tests.
+//
+// The cadence is inverted on purpose: one wait of waitInterval always
+// overshoots a waitTimeout budget, so the loop polls exactly once and then
+// gives up, whatever the scheduler does. These used to pass
+// pollTimeout: time.Nanosecond, which made the deadline check before the
+// first poll a coin flip. Roughly a third of runs polled anyway, consumed the
+// delete response as the projects-list reply, and failed with a parse error
+// instead of a timeout. A negative timeout is not an option either:
+// pollTimeoutOrDefault treats anything <= 0 as unset.
+const (
+	waitTimeout  = 10 * time.Millisecond
+	waitInterval = 25 * time.Millisecond
+)
+
 func TestProvision_WaitForProjectTimeout_SelfCleanupSucceeds(t *testing.T) {
 	fake := &fakeCmdRunner{responses: []fakeCmdResponse{
-		{stdout: `{"ref":"proj123","name":"run-1"}`}, // projects create
+		{stdout: `{"ref":"proj123","name":"run-1"}`},                                             // projects create
+		{stdout: `{"projects":[{"ref":"proj123","status":"COMING_UP","database":{"host":""}}]}`}, // projects list: not healthy yet
 		{stdout: ""}, // projects delete (self-cleanup)
 	}}
-	p := &Provider{out: io.Discard, run: fake.run, checkCLI: noopCheckCLI, pollTimeout: time.Nanosecond, cfg: &config.Config{}}
+	p := &Provider{
+		out: io.Discard, run: fake.run, checkCLI: noopCheckCLI,
+		pollTimeout: waitTimeout, pollInterval: waitInterval,
+		cfg: &config.Config{},
+	}
+
 	outputs, err := p.Provision(context.Background(), "run-1", testProvisionConfig())
 	if err == nil || !strings.Contains(err.Error(), "did not become ready") {
 		t.Fatalf("expected a did-not-become-ready error, got %v", err)
@@ -763,17 +785,26 @@ func TestProvision_WaitForProjectTimeout_SelfCleanupSucceeds(t *testing.T) {
 	if outputs != nil {
 		t.Errorf("expected nil outputs after successful self-cleanup, got %v", outputs)
 	}
-	if len(fake.calls) != 2 {
-		t.Fatalf("expected 2 CLI calls (create, delete), got %d: %v", len(fake.calls), fake.calls)
+	if len(fake.calls) != 3 {
+		t.Fatalf("expected 3 CLI calls (create, list, delete), got %d: %v", len(fake.calls), fake.calls)
+	}
+	if got := fake.calls[1]; !slices.Contains(got, "list") {
+		t.Errorf("second call was not a projects list: %v", got)
 	}
 }
 
 func TestProvision_WaitForProjectTimeout_SelfCleanupFails(t *testing.T) {
 	fake := &fakeCmdRunner{responses: []fakeCmdResponse{
-		{stdout: `{"ref":"proj123","name":"run-1"}`},                   // projects create
-		{stdout: "", stderr: "boom", err: fmt.Errorf("exit status 1")}, // projects delete fails
+		{stdout: `{"ref":"proj123","name":"run-1"}`},                                             // projects create
+		{stdout: `{"projects":[{"ref":"proj123","status":"COMING_UP","database":{"host":""}}]}`}, // projects list: not healthy yet
+		{stdout: "", stderr: "boom", err: fmt.Errorf("exit status 1")},                           // projects delete fails
 	}}
-	p := &Provider{out: io.Discard, run: fake.run, checkCLI: noopCheckCLI, pollTimeout: time.Nanosecond, cfg: &config.Config{}}
+	p := &Provider{
+		out: io.Discard, run: fake.run, checkCLI: noopCheckCLI,
+		pollTimeout: waitTimeout, pollInterval: waitInterval,
+		cfg: &config.Config{},
+	}
+
 	outputs, err := p.Provision(context.Background(), "run-1", testProvisionConfig())
 	if err == nil || !strings.Contains(err.Error(), "did not become ready") {
 		t.Fatalf("expected a did-not-become-ready error, got %v", err)
