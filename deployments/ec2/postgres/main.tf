@@ -211,9 +211,15 @@ locals {
     # Detect the instance store NVMe device dynamically: it's whichever nvme*n1
     # device is not backing the root filesystem.
     ROOT_DISK=$(lsblk -ndo PKNAME "$(findmnt -no SOURCE /)")
-    NVME_DEV=$(ls /dev/nvme*n1 | grep -v "$ROOT_DISK" | head -1)
+    # `|| true` is relevant because of the `set -o pipefail` at the top of this
+    # script, grep exits 1 when the only nvme device is the root disk, which
+    # aborts here and leaves the operator with a bare "exit status 1" -- the
+    # check below, the one that explains the actual problem, never runs.
+    NVME_DEV=$(ls /dev/nvme*n1 2>/dev/null | grep -v "$ROOT_DISK" | head -1 || true)
     if [ -z "$NVME_DEV" ]; then
-      echo "ERROR: no instance store NVMe device found" >&2
+      echo "ERROR: no instance store NVMe device found." >&2
+      echo "ERROR: root disk is $ROOT_DISK; nvme devices present: $(ls /dev/nvme*n1 2>/dev/null | tr '\n' ' ')" >&2
+      echo "ERROR: this module puts pgdata on local NVMe, so it needs an instance type that has some." >&2
       exit 1
     fi
     mkfs.ext4 -F "$NVME_DEV"
