@@ -26,6 +26,10 @@ import (
 
 const (
 	outputKeyProjectRef = "project_ref"
+
+	// outputKeyVendor declares which cloud this target runs on, so post-run tooling
+	// knows whose APIs and credentials apply.
+	outputKeyVendor = "vendor"
 	// _supabase_profile stores the CLI profile used at provision time so
 	// teardown can use the same profile on a fresh CI runner.
 	outputKeyProfile = "_supabase_profile"
@@ -409,6 +413,7 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 		outputKeyProjectRef: ref,
 		outputKeyProfile:    c.Profile,
 		outputKeyRunID:      runID,
+		outputKeyVendor:     "supabase",
 	}
 	return outputs, nil
 }

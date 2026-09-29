@@ -1,0 +1,78 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/dbarena/benchctl/internal/config"
+	"github.com/dbarena/benchctl/internal/diagnostics"
+	"github.com/dbarena/benchctl/internal/engine"
+	"github.com/dbarena/benchctl/internal/runstate"
+)
+
+// buildDiagnosticsCollector resolves a cloud vendor to a collector, mirroring
+// buildTargetProvider. A nil collector with a nil error means the vendor is
+// recognised but has no collector yet; the caller says so and moves on.
+func buildDiagnosticsCollector(_ *config.Config, vendor string) (diagnostics.Collector, error) {
+	switch vendor {
+	case "":
+		return nil, nil
+	case diagnostics.VendorAWS, diagnostics.VendorGCP, diagnostics.VendorSupabase:
+		// Implementations land one vendor at a time.
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unsupported diagnostics collector %q", vendor)
+	}
+}
+
+// collectDiagnostics gathers provider-side data for a finished run into
+// <dest>/diagnostics.
+//
+// It reports every problem and returns nil for all of them. `benchctl fetch`
+// must keep exiting 0: dbarenactl retries a failing fetch three times and then
+// stops the entire sweep, so a missing credential or an unsupported vendor
+// would take a whole benchmark sweep down with it.
+func collectDiagnostics(ctx context.Context, state *runstate.State, dest string) {
+	vendor := diagnostics.Vendor(state.TargetOutputs)
+	if vendor == "" {
+		fmt.Fprintf(os.Stderr, "diagnostics: target %q declares no cloud vendor, so there is nothing to collect; skipping\n", state.TargetProvider)
+		return
+	}
+
+	collector, err := buildDiagnosticsCollector(appCfg, vendor)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "diagnostics: %v\n", err)
+		return
+	}
+	if collector == nil {
+		fmt.Fprintf(os.Stderr, "diagnostics: no collector implemented for %s yet; skipping\n", vendor)
+		return
+	}
+
+	windows, err := diagnostics.LoadStepWindows(dest)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "diagnostics: %v\n", err)
+		return
+	}
+	if len(windows) == 0 {
+		fmt.Fprintf(os.Stderr, "diagnostics: no %s in %s, so there is no benchmark window to collect over; skipping\n",
+			engine.StepWindowsFilename, dest)
+		return
+	}
+
+	diagDir := filepath.Join(dest, diagnostics.DirName)
+	idx, err := diagnostics.Run(ctx, os.Stderr, collector, diagnostics.Request{
+		RunID:   state.RunID,
+		Outputs: state.TargetOutputs,
+		Windows: windows,
+		Dest:    diagDir,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "diagnostics: %v\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Diagnostics (%s): %d artifacts over %d window(s) in %s\n",
+		idx.Collector, len(idx.Artifacts), len(idx.Windows), diagDir)
+}

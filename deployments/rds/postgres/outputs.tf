@@ -44,3 +44,8 @@ output "dbi_resource_id" {
   description = "Performance Insights' API (GetResourceMetrics, DescribeDimensionKeys) resource id."
   value       = aws_db_instance.this.resource_id
 }
+
+output "vendor" {
+  description = "Vendor this target runs on. Used e.g. for fetching diagnostics."
+  value       = "aws"
+}

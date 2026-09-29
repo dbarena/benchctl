@@ -12,7 +12,10 @@ import (
 	"github.com/dbarena/benchctl/internal/engine"
 )
 
-var fetchDest string
+var (
+	fetchDest          string
+	fetchNoDiagnostics bool
+)
 
 var fetchCmd = &cobra.Command{
 	Use:   "fetch <run-id>",
@@ -23,6 +26,7 @@ var fetchCmd = &cobra.Command{
 
 func init() {
 	fetchCmd.Flags().StringVar(&fetchDest, "dest", ".", "Local directory to copy artifacts into (created if needed)")
+	fetchCmd.Flags().BoolVar(&fetchNoDiagnostics, "no-diagnostics", false, "Skip provider-side diagnostics collection")
 }
 
 func runFetch(_ *cobra.Command, args []string) error {
@@ -46,25 +50,34 @@ func runFetch(_ *cobra.Command, args []string) error {
 		}
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// A run with no driver outputs (driver: local) has no remote artifacts to
+	// copy, but its target may still have provider-side diagnostics worth
+	// collecting, so this is a note rather than a failure.
 	if len(state.DriverOutputs) == 0 {
-		return fmt.Errorf("run %s: driver was not provisioned, so there is nothing to fetch", runID)
+		fmt.Fprintf(os.Stderr, "run %s: driver was not provisioned; no remote artifacts to copy\n", runID)
+	} else if err := fetchDriverArtifacts(ctx, state.DriverProvider, state.DriverOutputs); err != nil {
+		return err
+	} else {
+		fmt.Fprintf(os.Stderr, "Artifacts fetched to %s\n", fetchDest)
 	}
 
-	driver, err := buildDriverProvider(appCfg, state.DriverProvider)
+	if !fetchNoDiagnostics {
+		collectDiagnostics(ctx, state, fetchDest)
+	}
+	return nil
+}
+
+func fetchDriverArtifacts(ctx context.Context, providerName string, outputs map[string]string) error {
+	driver, err := buildDriverProvider(appCfg, providerName)
 	if err != nil {
 		return err
 	}
 	fetcher, ok := driver.(engine.ArtifactFetcher)
 	if !ok {
-		return fmt.Errorf("driver provider %q does not support fetch", state.DriverProvider)
+		return fmt.Errorf("driver provider %q does not support fetch", providerName)
 	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	if err := fetcher.FetchArtifacts(ctx, engine.Outputs(state.DriverOutputs), fetchDest); err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "Artifacts fetched to %s\n", fetchDest)
-	return nil
+	return fetcher.FetchArtifacts(ctx, engine.Outputs(outputs), fetchDest)
 }
