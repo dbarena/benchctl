@@ -450,10 +450,7 @@ func (p *Provider) FetchArtifacts(ctx context.Context, outputs engine.Outputs, l
 	target := p.cfg.DefaultSSHUser + "@" + ip
 
 	const remoteTar = "/tmp/benchctl-fetch.tar.gz"
-	packCmd := "set -e; d=$(mktemp -d); " +
-		"for f in benchctl/resume.log results_*.json raw_samples_*.csv; do cp -p $HOME/$f \"$d/\" 2>/dev/null || true; done; " +
-		"tar -czf " + remoteTar + " -C \"$d\" .; rm -rf \"$d\""
-	if err := p.ssh(ctx, keyPath, target, packCmd); err != nil {
+	if err := p.ssh(ctx, keyPath, target, packArtifactsCmd(remoteTar)); err != nil {
 		return fmt.Errorf("%s: fetch: package artifacts on driver: %w", p.cfg.ProviderName, err)
 	}
 	defer func() {
@@ -475,6 +472,28 @@ func (p *Provider) FetchArtifacts(ctx context.Context, outputs engine.Outputs, l
 		return fmt.Errorf("%s: fetch: extract artifacts: %w", p.cfg.ProviderName, err)
 	}
 	return nil
+}
+
+// fetchArtifactPaths lists what `benchctl fetch` copies off the driver
+// instance, relative to $HOME. Entries may be globs; the remote shell expands
+// them.
+var fetchArtifactPaths = []string{
+	"benchctl/resume.log",
+	"results_*.json",
+	"raw_samples_*.csv",
+	engine.StepWindowsFilename,
+}
+
+// packArtifactsCmd builds the remote shell command that gathers
+// fetchArtifactPaths into a single tarball at remoteTar.
+//
+// A path that does not exist is skipped rather than failing the command:
+// engine.ArtifactFetcher requires fetch to work before a run has reached the
+// phase that writes a given artifact.
+func packArtifactsCmd(remoteTar string) string {
+	return "set -e; d=$(mktemp -d); " +
+		"for f in " + strings.Join(fetchArtifactPaths, " ") + "; do cp -p $HOME/$f \"$d/\" 2>/dev/null || true; done; " +
+		"tar -czf " + remoteTar + " -C \"$d\" .; rm -rf \"$d\""
 }
 
 // extractTarGz extracts a local gzip-compressed tar archive into destDir,

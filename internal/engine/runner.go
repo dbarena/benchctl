@@ -79,6 +79,13 @@ type Runner struct {
 	// the same store record, and whichever write lands second silently
 	// reverts the other's change.
 	stateMu *sync.Mutex
+	// stepWindows accumulates the interval of every measured suite step and is
+	// serialized to StepWindowsFilename as the suite advances. Written only
+	// from the goroutine running the suite.
+	stepWindows []StepWindow
+	// stepWindowsUnwritable records that writing StepWindowsFilename already
+	// failed, so the warning is printed once instead of once per step.
+	stepWindowsUnwritable bool
 }
 
 var phaseStyle = color.New(color.FgHiCyan, color.Bold)
@@ -393,6 +400,7 @@ func (r *Runner) Run(ctx context.Context, s *schema.Scenario, inputs schema.Reso
 					runID:           runID,
 					tc:              tc,
 					stepOutputs:     stepOutputs,
+					benchmark:       entry.Name,
 					combo:           combo,
 					iteration:       iter,
 					infoMap:         &infoMap,
@@ -865,6 +873,7 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 					runID:           runID,
 					tc:              tc,
 					stepOutputs:     stepOutputs,
+					benchmark:       entry.Name,
 					combo:           combo,
 					iteration:       iter,
 					infoMap:         &infoMap,
@@ -1001,6 +1010,7 @@ type suiteStepEnv struct {
 	runID       string
 	tc          *TemplateContext
 	stepOutputs Outputs
+	benchmark   string
 	combo       schema.ResolvedFixture
 	iteration   int
 
@@ -1023,6 +1033,9 @@ type suiteStepEnv struct {
 // runSuiteStep executes one step of a benchmark entry and folds its result
 // into env. isFinalWorkloadStep marks the last workload step of the whole
 // suite: after it, workload.execute is completed rather than still running.
+//
+// A step that dispatchSuiteStep reports as measured also gets its interval
+// recorded in StepWindowsFilename, including when it failed.
 func (r *Runner) runSuiteStep(ctx context.Context, env *suiteStepEnv, step schema.SuiteStep, isFinalWorkloadStep bool) error {
 	stepStart := time.Now().UTC()
 	r.setState(env.runID, func(st *runstate.State) {
@@ -1033,33 +1046,61 @@ func (r *Runner) runSuiteStep(ctx context.Context, env *suiteStepEnv, step schem
 	})
 	resolvedArgs, err := ResolveMap(step.Args, env.tc)
 	if err != nil {
+		// No window: the step never got as far as doing anything.
 		return fmt.Errorf("suite step %s: resolve args: %w", step.Name, err)
 	}
 
+	measured, stepErr := r.dispatchSuiteStep(ctx, env, step, resolvedArgs, isFinalWorkloadStep)
+	if measured {
+		r.recordStepWindow(StepWindow{
+			Step:      step.Name,
+			Type:      step.Type,
+			Benchmark: env.benchmark,
+			Iteration: env.iteration + 1,
+			Fixture:   maps.Clone(env.combo),
+			StartedAt: stepStart,
+			EndedAt:   time.Now().UTC(),
+			Failed:    stepErr != nil,
+		})
+	}
+	return stepErr
+}
+
+// dispatchSuiteStep runs the step and reports whether it was a measurement
+// interval worth recording a window for.
+//
+// Only steps that occupy real time qualify: a workload step that actually
+// executed, and a `type: collect` step, which samples the target at a point
+// the caller wants to correlate against provider-side data. `metadata` and
+// `sql` steps are sub-second bookkeeping, and recording them would bury the
+// handful of intervals that matter under dozens of near-zero ones.
+func (r *Runner) dispatchSuiteStep(ctx context.Context, env *suiteStepEnv, step schema.SuiteStep, resolvedArgs map[string]string, isFinalWorkloadStep bool) (measured bool, err error) {
 	switch step.Type {
 	case "metadata":
 		r.logf("Collecting metadata [%s]", step.Name)
 		val, err := collectMetadata(ctx, r.Out, env.stepOutputs, step.Command, resolvedArgs["name"], resolvedArgs["query"])
 		if err != nil {
-			return fmt.Errorf("suite step %s: %w", step.Name, err)
+			return false, fmt.Errorf("suite step %s: %w", step.Name, err)
 		}
 		if *env.infoMap == nil {
 			*env.infoMap = make(map[string]string)
 		}
 		(*env.infoMap)[resolvedArgs["name"]] = val
 		env.tc.Info = *env.infoMap
+		return false, nil
 
 	case "sql":
 		r.logf("Running SQL [%s]", step.Name)
 		if err := runSQLStatement(ctx, r.Out, env.stepOutputs, step.Name, resolvedArgs["query"]); err != nil {
-			return fmt.Errorf("suite step %s: %w", step.Name, err)
+			return false, fmt.Errorf("suite step %s: %w", step.Name, err)
 		}
+		return false, nil
 
 	case "collect":
 		r.logf("Collecting PG metrics [%s]", step.Name)
 		pts, err := collectPGMetrics(ctx, r.Out, env.stepOutputs, step.Name, resolvedArgs["family"], resolvedArgs["query"])
 		if err != nil {
-			return fmt.Errorf("suite step %s: %w", step.Name, err)
+			return true, fmt.Errorf("suite step %s: %w", step.Name, err)
 		}
 		if len(pts) > 0 {
 			tagPointsWithStep(pts, step.Name)
@@ -1070,14 +1111,18 @@ func (r *Runner) runSuiteStep(ctx context.Context, env *suiteStepEnv, step schem
 			sm.Points = append(sm.Points, pts...)
 			(*env.workloadMetrics)[StructuredKey] = sm
 		}
+		return true, nil
 
 	default:
 		adapter, ok := r.Workloads[step.Type]
 		if !ok {
-			return fmt.Errorf("suite step %s: unknown workload adapter %q", step.Name, step.Type)
+			return false, fmt.Errorf("suite step %s: unknown workload adapter %q", step.Name, step.Type)
 		}
 		if !env.workloadPending() {
-			return nil
+			// Already completed on an earlier attempt of this run; its window
+			// was recorded then, and recording a second near-zero one now
+			// would misreport the benchmark as having taken no time.
+			return false, nil
 		}
 		resolvedStep := schema.SuiteStep{Name: step.Name, Type: step.Type, Command: resolveCommandPath(step.Command, r.ScenarioPath), Args: resolvedArgs}
 		r.setState(env.runID, func(st *runstate.State) {
@@ -1088,7 +1133,7 @@ func (r *Runner) runSuiteStep(ctx context.Context, env *suiteStepEnv, step schem
 		stepMetrics, execErr := adapter.Run(ctx, env.stepOutputs, resolvedStep)
 		stopHB()
 		if execErr != nil {
-			return env.failWorkload(fmt.Errorf("execute: %w", execErr))
+			return true, env.failWorkload(fmt.Errorf("execute: %w", execErr))
 		}
 		labelStepMetrics(stepMetrics, step.Name)
 		mergeMetrics(env.workloadMetrics, stepMetrics)
@@ -1099,8 +1144,8 @@ func (r *Runner) runSuiteStep(ctx context.Context, env *suiteStepEnv, step schem
 				st.Phases[runstate.PhaseWorkloadExecute] = runstate.StatusRunning
 			}
 		})
+		return true, nil
 	}
-	return nil
 }
 
 // runBetweenBenchmarksSteps executes suite.between-benchmarks steps between

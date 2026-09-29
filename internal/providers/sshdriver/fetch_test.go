@@ -101,3 +101,31 @@ func TestFetchArtifacts_RequiresPublicIP(t *testing.T) {
 		t.Errorf("error %q should mention public_ip", err)
 	}
 }
+
+// TestPackArtifactsCmd_CopiesEveryKnownArtifact guards the remote pack
+// command against an artifact silently dropping out of it. step_windows.json
+// in particular is load-bearing for provider-side diagnostics: without it a
+// fetch has no benchmark window to query Performance Insights or Cloud
+// Monitoring over, and the failure is invisible (an absent file is
+// indistinguishable from a run that produced none).
+func TestPackArtifactsCmd_CopiesEveryKnownArtifact(t *testing.T) {
+	got := packArtifactsCmd("/tmp/some-fetch.tar.gz")
+
+	for _, want := range []string{
+		"benchctl/resume.log",
+		"results_*.json",
+		"raw_samples_*.csv",
+		engine.StepWindowsFilename,
+		"/tmp/some-fetch.tar.gz",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("pack command is missing %q\ngot: %s", want, got)
+		}
+	}
+
+	// A missing file must not abort the copy loop: fetch is documented as safe
+	// to call before a run has written everything.
+	if !strings.Contains(got, "|| true") {
+		t.Errorf("pack command does not tolerate missing files\ngot: %s", got)
+	}
+}
