@@ -389,75 +389,20 @@ func (r *Runner) Run(ctx context.Context, s *schema.Scenario, inputs schema.Reso
 					stepOutputs = targetOutputs
 				}
 				lastWorkloadIdx := lastWorkloadStep(entry.Steps, r.Workloads)
+				env := &suiteStepEnv{
+					runID:           runID,
+					tc:              tc,
+					stepOutputs:     stepOutputs,
+					combo:           combo,
+					iteration:       iter,
+					infoMap:         &infoMap,
+					workloadMetrics: &workloadMetrics,
+					workloadPending: func() bool { return true },
+					failWorkload:    func(err error) error { return err },
+				}
 				for si, step := range entry.Steps {
-					stepStart := time.Now().UTC()
-					r.setState(runID, func(st *runstate.State) {
-						st.CurrentFixture = combo
-						st.CurrentIteration = iter
-						st.CurrentStep = step.Name
-						st.StepStartedAt = &stepStart
-					})
-					resolvedArgs, argErr := ResolveMap(step.Args, tc)
-					if argErr != nil {
-						return fmt.Errorf("suite step %s: resolve args: %w", step.Name, argErr)
-					}
-					switch step.Type {
-					case "metadata":
-						r.logf("Collecting metadata [%s]", step.Name)
-						val, mErr := collectMetadata(ctx, r.Out, stepOutputs, step.Command, resolvedArgs["name"], resolvedArgs["query"])
-						if mErr != nil {
-							return fmt.Errorf("suite step %s: %w", step.Name, mErr)
-						}
-						if infoMap == nil {
-							infoMap = make(map[string]string)
-						}
-						infoMap[resolvedArgs["name"]] = val
-						tc.Info = infoMap
-					case "sql":
-						r.logf("Running SQL [%s]", step.Name)
-						if err := runSQLStatement(ctx, r.Out, stepOutputs, step.Name, resolvedArgs["query"]); err != nil {
-							return fmt.Errorf("suite step %s: %w", step.Name, err)
-						}
-					case "collect":
-						r.logf("Collecting PG metrics [%s]", step.Name)
-						pts, collectErr := collectPGMetrics(ctx, r.Out, stepOutputs, step.Name, resolvedArgs["family"], resolvedArgs["query"])
-						if collectErr != nil {
-							return fmt.Errorf("suite step %s: %w", step.Name, collectErr)
-						}
-						if len(pts) > 0 {
-							tagPointsWithStep(pts, step.Name)
-							if workloadMetrics == nil {
-								workloadMetrics = make(Metrics)
-							}
-							sm, _ := workloadMetrics[StructuredKey].(StructuredMetrics)
-							sm.Points = append(sm.Points, pts...)
-							workloadMetrics[StructuredKey] = sm
-						}
-					default:
-						adapter, ok := r.Workloads[step.Type]
-						if !ok {
-							return fmt.Errorf("suite step %s: unknown workload adapter %q", step.Name, step.Type)
-						}
-						resolvedStep := schema.SuiteStep{Name: step.Name, Type: step.Type, Command: resolveCommandPath(step.Command, r.ScenarioPath), Args: resolvedArgs}
-						r.setState(runID, func(st *runstate.State) {
-							st.Phases[runstate.PhaseWorkloadExecute] = runstate.StatusRunning
-						})
-						r.logf("Running workload [%s]", step.Name)
-						stopHB := r.startHeartbeat(runID)
-						stepMetrics, execErr := adapter.Run(ctx, stepOutputs, resolvedStep)
-						stopHB()
-						if execErr != nil {
-							return fmt.Errorf("execute: %w", execErr)
-						}
-						labelStepMetrics(stepMetrics, step.Name)
-						mergeMetrics(&workloadMetrics, stepMetrics)
-						r.setState(runID, func(st *runstate.State) {
-							if isLastOverall && si == lastWorkloadIdx {
-								st.Phases[runstate.PhaseWorkloadExecute] = runstate.StatusCompleted
-							} else {
-								st.Phases[runstate.PhaseWorkloadExecute] = runstate.StatusRunning
-							}
-						})
+					if err := r.runSuiteStep(ctx, env, step, isLastOverall && si == lastWorkloadIdx); err != nil {
+						return err
 					}
 				}
 
@@ -916,77 +861,20 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 					stepOutputs = targetOutputs
 				}
 				lastWorkloadIdx := lastWorkloadStep(entry.Steps, r.Workloads)
+				env := &suiteStepEnv{
+					runID:           runID,
+					tc:              tc,
+					stepOutputs:     stepOutputs,
+					combo:           combo,
+					iteration:       iter,
+					infoMap:         &infoMap,
+					workloadMetrics: &workloadMetrics,
+					workloadPending: func() bool { return pending(runstate.PhaseWorkloadExecute) },
+					failWorkload:    func(err error) error { return fail(runstate.PhaseWorkloadExecute, err) },
+				}
 				for si, step := range entry.Steps {
-					stepStart := time.Now().UTC()
-					r.setState(runID, func(st *runstate.State) {
-						st.CurrentFixture = combo
-						st.CurrentIteration = iter
-						st.CurrentStep = step.Name
-						st.StepStartedAt = &stepStart
-					})
-					resolvedArgs, argErr := ResolveMap(step.Args, tc)
-					if argErr != nil {
-						return fmt.Errorf("suite step %s: resolve args: %w", step.Name, argErr)
-					}
-					switch step.Type {
-					case "metadata":
-						r.logf("Collecting metadata [%s]", step.Name)
-						val, mErr := collectMetadata(ctx, r.Out, stepOutputs, step.Command, resolvedArgs["name"], resolvedArgs["query"])
-						if mErr != nil {
-							return fmt.Errorf("suite step %s: %w", step.Name, mErr)
-						}
-						if infoMap == nil {
-							infoMap = make(map[string]string)
-						}
-						infoMap[resolvedArgs["name"]] = val
-						tc.Info = infoMap
-					case "sql":
-						r.logf("Running SQL [%s]", step.Name)
-						if err := runSQLStatement(ctx, r.Out, stepOutputs, step.Name, resolvedArgs["query"]); err != nil {
-							return fmt.Errorf("suite step %s: %w", step.Name, err)
-						}
-					case "collect":
-						r.logf("Collecting PG metrics [%s]", step.Name)
-						pts, collectErr := collectPGMetrics(ctx, r.Out, stepOutputs, step.Name, resolvedArgs["family"], resolvedArgs["query"])
-						if collectErr != nil {
-							return fmt.Errorf("suite step %s: %w", step.Name, collectErr)
-						}
-						if len(pts) > 0 {
-							tagPointsWithStep(pts, step.Name)
-							if workloadMetrics == nil {
-								workloadMetrics = make(Metrics)
-							}
-							sm, _ := workloadMetrics[StructuredKey].(StructuredMetrics)
-							sm.Points = append(sm.Points, pts...)
-							workloadMetrics[StructuredKey] = sm
-						}
-					default:
-						adapter, ok := r.Workloads[step.Type]
-						if !ok {
-							return fmt.Errorf("suite step %s: unknown workload adapter %q", step.Name, step.Type)
-						}
-						resolvedStep := schema.SuiteStep{Name: step.Name, Type: step.Type, Command: resolveCommandPath(step.Command, r.ScenarioPath), Args: resolvedArgs}
-						if pending(runstate.PhaseWorkloadExecute) {
-							r.setState(runID, func(st *runstate.State) {
-								st.Phases[runstate.PhaseWorkloadExecute] = runstate.StatusRunning
-							})
-							r.logf("Running workload [%s]", step.Name)
-							stopHB := r.startHeartbeat(runID)
-							stepMetrics, execErr := adapter.Run(ctx, stepOutputs, resolvedStep)
-							stopHB()
-							if execErr != nil {
-								return fail(runstate.PhaseWorkloadExecute, fmt.Errorf("execute: %w", execErr))
-							}
-							labelStepMetrics(stepMetrics, step.Name)
-							mergeMetrics(&workloadMetrics, stepMetrics)
-							r.setState(runID, func(st *runstate.State) {
-								if isLastOverall && si == lastWorkloadIdx {
-									st.Phases[runstate.PhaseWorkloadExecute] = runstate.StatusCompleted
-								} else {
-									st.Phases[runstate.PhaseWorkloadExecute] = runstate.StatusRunning
-								}
-							})
-						}
+					if err := r.runSuiteStep(ctx, env, step, isLastOverall && si == lastWorkloadIdx); err != nil {
+						return err
 					}
 				}
 
@@ -1103,6 +991,116 @@ func (r *Runner) startHeartbeat(runID string) func() {
 		}
 	}()
 	return func() { close(done) }
+}
+
+// suiteStepEnv is the per-benchmark context one suite step runs in. Run and
+// Resume each build one per benchmark entry and reuse it for every step in
+// that entry, so step dispatch has a single implementation rather than two
+// copies that drift apart.
+type suiteStepEnv struct {
+	runID       string
+	tc          *TemplateContext
+	stepOutputs Outputs
+	combo       schema.ResolvedFixture
+	iteration   int
+
+	// infoMap accumulates `type: metadata` results and workloadMetrics
+	// accumulates everything the collector will receive. Both belong to the
+	// caller and outlive any single step, hence the pointers.
+	infoMap         *map[string]string
+	workloadMetrics *Metrics
+
+	// workloadPending reports whether workload.execute still has work to do.
+	// Resume returns false once an earlier attempt completed it; Run always
+	// returns true.
+	workloadPending func() bool
+	// failWorkload converts an adapter error into the error the caller
+	// returns. Resume records the phase as failed first; Run passes it
+	// through unchanged.
+	failWorkload func(error) error
+}
+
+// runSuiteStep executes one step of a benchmark entry and folds its result
+// into env. isFinalWorkloadStep marks the last workload step of the whole
+// suite: after it, workload.execute is completed rather than still running.
+func (r *Runner) runSuiteStep(ctx context.Context, env *suiteStepEnv, step schema.SuiteStep, isFinalWorkloadStep bool) error {
+	stepStart := time.Now().UTC()
+	r.setState(env.runID, func(st *runstate.State) {
+		st.CurrentFixture = env.combo
+		st.CurrentIteration = env.iteration
+		st.CurrentStep = step.Name
+		st.StepStartedAt = &stepStart
+	})
+	resolvedArgs, err := ResolveMap(step.Args, env.tc)
+	if err != nil {
+		return fmt.Errorf("suite step %s: resolve args: %w", step.Name, err)
+	}
+
+	switch step.Type {
+	case "metadata":
+		r.logf("Collecting metadata [%s]", step.Name)
+		val, err := collectMetadata(ctx, r.Out, env.stepOutputs, step.Command, resolvedArgs["name"], resolvedArgs["query"])
+		if err != nil {
+			return fmt.Errorf("suite step %s: %w", step.Name, err)
+		}
+		if *env.infoMap == nil {
+			*env.infoMap = make(map[string]string)
+		}
+		(*env.infoMap)[resolvedArgs["name"]] = val
+		env.tc.Info = *env.infoMap
+
+	case "sql":
+		r.logf("Running SQL [%s]", step.Name)
+		if err := runSQLStatement(ctx, r.Out, env.stepOutputs, step.Name, resolvedArgs["query"]); err != nil {
+			return fmt.Errorf("suite step %s: %w", step.Name, err)
+		}
+
+	case "collect":
+		r.logf("Collecting PG metrics [%s]", step.Name)
+		pts, err := collectPGMetrics(ctx, r.Out, env.stepOutputs, step.Name, resolvedArgs["family"], resolvedArgs["query"])
+		if err != nil {
+			return fmt.Errorf("suite step %s: %w", step.Name, err)
+		}
+		if len(pts) > 0 {
+			tagPointsWithStep(pts, step.Name)
+			if *env.workloadMetrics == nil {
+				*env.workloadMetrics = make(Metrics)
+			}
+			sm, _ := (*env.workloadMetrics)[StructuredKey].(StructuredMetrics)
+			sm.Points = append(sm.Points, pts...)
+			(*env.workloadMetrics)[StructuredKey] = sm
+		}
+
+	default:
+		adapter, ok := r.Workloads[step.Type]
+		if !ok {
+			return fmt.Errorf("suite step %s: unknown workload adapter %q", step.Name, step.Type)
+		}
+		if !env.workloadPending() {
+			return nil
+		}
+		resolvedStep := schema.SuiteStep{Name: step.Name, Type: step.Type, Command: resolveCommandPath(step.Command, r.ScenarioPath), Args: resolvedArgs}
+		r.setState(env.runID, func(st *runstate.State) {
+			st.Phases[runstate.PhaseWorkloadExecute] = runstate.StatusRunning
+		})
+		r.logf("Running workload [%s]", step.Name)
+		stopHB := r.startHeartbeat(env.runID)
+		stepMetrics, execErr := adapter.Run(ctx, env.stepOutputs, resolvedStep)
+		stopHB()
+		if execErr != nil {
+			return env.failWorkload(fmt.Errorf("execute: %w", execErr))
+		}
+		labelStepMetrics(stepMetrics, step.Name)
+		mergeMetrics(env.workloadMetrics, stepMetrics)
+		r.setState(env.runID, func(st *runstate.State) {
+			if isFinalWorkloadStep {
+				st.Phases[runstate.PhaseWorkloadExecute] = runstate.StatusCompleted
+			} else {
+				st.Phases[runstate.PhaseWorkloadExecute] = runstate.StatusRunning
+			}
+		})
+	}
+	return nil
 }
 
 // runBetweenBenchmarksSteps executes suite.between-benchmarks steps between

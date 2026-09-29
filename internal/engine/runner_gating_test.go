@@ -342,3 +342,52 @@ func TestResume_LegacyPreparePhaseIgnored(t *testing.T) {
 		t.Errorf("prepare ran %d times, want 1: %v", got, calls)
 	}
 }
+
+// TestResume_SkipsWorkloadWhenAlreadyCompleted guards the workloadPending
+// hook that runSuiteStep uses to keep Run and Resume on one code path: a
+// Resume whose workload.execute phase already completed on an earlier attempt
+// must not re-run the load generator, but must still reach collection. Run
+// has no such gate and always executes, which the other tests here cover.
+func TestResume_SkipsWorkloadWhenAlreadyCompleted(t *testing.T) {
+	var calls []string
+	store := newSnapshottingStore()
+	runID := "resume-skip-workload"
+
+	initial := runstate.NewState(runID, "test", "", map[string]any{"warehouses": int64(10)})
+	initial.Phases[runstate.PhaseDriverSetup] = runstate.StatusCompleted
+	initial.Phases[runstate.PhaseWorkloadExecute] = runstate.StatusCompleted
+	initial.TargetOutputs = map[string]string{}
+	initial.DriverOutputs = map[string]string{}
+	if err := store.Create(initial); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	r := engine.Runner{
+		Target:    &stubTarget{calls: &calls},
+		Driver:    &stubDriver{calls: &calls},
+		Workloads: map[string]engine.WorkloadAdapter{"go-tpc": &stubWorkload{calls: &calls}},
+		Collector: &stubCollector{calls: &calls},
+		Store:     store,
+	}
+
+	loaded, err := store.Load(runID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := r.Resume(context.Background(), multiIterationScenario(), loaded); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+
+	var collected bool
+	for _, c := range calls {
+		if c == "workload.run" {
+			t.Fatalf("ran the workload adapter although workload.execute was already completed; calls: %v", calls)
+		}
+		if c == "collector.collect" {
+			collected = true
+		}
+	}
+	if !collected {
+		t.Errorf("Resume never reached collection; calls: %v", calls)
+	}
+}
