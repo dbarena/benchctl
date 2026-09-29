@@ -259,15 +259,8 @@ func (p *Provider) Bootstrap(ctx context.Context, req engine.BootstrapRequest) e
 
 	// Wait for cloud-init to finish so startup-script tools (go-tpc, etc.) are ready.
 	consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: waiting for cloud-init to complete", p.cfg.ProviderName))
-	cloudInitCtx, cancelCloudInit := context.WithTimeout(ctx, cloudInitTimeout)
-	err = p.ssh(cloudInitCtx, keyPath, target, "cloud-init status --wait")
-	timedOut := cloudInitCtx.Err() == context.DeadlineExceeded
-	cancelCloudInit()
-	if err != nil {
-		if timedOut {
-			return fmt.Errorf("%s: bootstrap: cloud-init wait exceeded %s: %w", p.cfg.ProviderName, cloudInitTimeout, err)
-		}
-		return fmt.Errorf("%s: bootstrap: cloud-init wait: %w", p.cfg.ProviderName, err)
+	if err := engine.WaitForCloudInit(ctx, p.out, keyPath, sshUser, ip, cloudInitTimeout); err != nil {
+		return fmt.Errorf("%s: bootstrap: %w", p.cfg.ProviderName, err)
 	}
 
 	consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: preparing remote directory", p.cfg.ProviderName))

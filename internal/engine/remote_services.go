@@ -64,11 +64,8 @@ func (r *Runner) deployRemoteServices(ctx context.Context, cfg map[string]any, o
 		return fmt.Errorf("wait for SSH: %w", err)
 	}
 	r.logf("Waiting for cloud-init")
-	cloudInitCtx, cancelCloudInit := context.WithTimeout(ctx, cloudInitTimeout)
-	err = RunSSH(cloudInitCtx, r.Out, keyPath, user, ip, "cloud-init status --wait")
-	cancelCloudInit()
-	if err != nil {
-		return fmt.Errorf("cloud-init wait (exceeded %s?): %w", cloudInitTimeout, err)
+	if err := WaitForCloudInit(ctx, r.Out, keyPath, user, ip, cloudInitTimeout); err != nil {
+		return err
 	}
 	if err := RunSSH(ctx, r.Out, keyPath, user, ip, "mkdir -p "+remoteServicesDir); err != nil {
 		return fmt.Errorf("mkdir services dir: %w", err)
