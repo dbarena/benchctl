@@ -1,0 +1,31 @@
+name: Go setup
+description: Install tools with mise and restore the Go build, module, and lint caches.
+
+# mise owns the Go toolchain; its version comes from the go.mod `toolchain` directive (see
+# mise.toml). Do not add actions/setup-go here: mise's shims take PATH precedence, so a
+# second toolchain would be installed and then shadowed.
+
+runs:
+  using: composite
+  steps:
+    - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+    # `mise run install-go-tpc` drops its binary in $(go env GOPATH)/bin, so ensure
+    # this ends up also in PATH.
+    - name: Add GOPATH/bin to PATH
+      shell: bash
+      run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+    # One shared key across every workflow: they all compile the same dependency set, so
+    # a single entry serves all of them. Caches written during a pull_request run land in
+    # that PR's own scope, so only the runs on main (see each workflow's push trigger)
+    # populate the scope that PRs can actually read from.
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+          ~/.cache/golangci-lint
+        key: go-${{ runner.os }}-${{ hashFiles('go.sum', 'go.mod', 'mise.toml') }}
+        restore-keys: |
+          go-${{ runner.os }}-

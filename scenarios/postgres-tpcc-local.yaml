@@ -93,6 +93,7 @@ suite:
             warehouses: "{{ inputs.warehouses }}"
             threads: "{{ inputs.client_threads }}"
             time: "{{ inputs.duration }}"
+            interval: "1s"
 driver:
   provider: local
 collector:

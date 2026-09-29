@@ -1,6 +1,16 @@
 module github.com/dbarena/benchctl
 
-go 1.26.1
+// The `go` directive is the minimum Go version this module supports.
+// `toolchain` is the version CI and local dev actually build with, and it is the
+// single source of truth: mise reads it from here (see mise.toml).
+//
+// Two rules when bumping Go:
+//   1. `toolchain` must be fully qualified (go1.26.1, not go1.26). mise silently
+//      reads no version at all from a short form, and CI then picks its own Go.
+//   2. `toolchain` must stay above the `go` directive, or `go mod tidy` deletes it.
+go 1.26.0
+
+toolchain go1.26.1
 
 require (
 	github.com/fatih/color v1.19.0

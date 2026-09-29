@@ -2,6 +2,16 @@ name: E2E Tests
 
 on:
   pull_request:
+    branches: [main]
+  # Runs on main seed the shared Go cache: a cache written during a pull_request run is
+  # scoped to that PR and unreadable by any other, so without this every PR starts cold.
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs, but let main runs finish so they always seed the cache.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   e2e-local:
@@ -13,16 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
+      - uses: ./.github/actions/go-setup
 
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-
+      # Started without waiting so VictoriaMetrics boots while Go compiles; the health
+      # gate below runs just before the first step that actually needs it.
       - name: Start observability stack
-        run: |
-          mise run observability-up
-          until curl -sf http://127.0.0.1:8428/health; do sleep 1; done
+        run: mise run observability-up-metrics
 
       - name: Install go-tpc
         run: mise run install-go-tpc
@@ -30,12 +36,15 @@ jobs:
       - name: Build benchctl
         run: mise build
 
+      - name: Wait for VictoriaMetrics
+        run: until curl -sf http://127.0.0.1:8428/health; do sleep 1; done
+
       - name: Run local scenario
         run: |
           ./benchctl run scenarios/postgres-tpcc-local.yaml \
             --set warehouses=1 \
             --set client_threads=2 \
-            --set duration=30s \
+            --set duration=15s \
             --set collector=victoriametrics
         env:
           BENCHCTL_METRICS_ENDPOINT: http://127.0.0.1:8428
@@ -46,11 +55,12 @@ jobs:
       - name: Verify results
         run: |
           RUN_ID=$(./benchctl status -a | awk 'NR==2 {print $1}')
-          # Poll until VM flushes in-memory data (inmemoryDataFlushInterval default: 5s)
-          for i in {1..12}; do
-            sleep 5
+          # Poll until VM makes the samples queryable (-search.latencyOffset, set to 1s
+          # in deployments/local/observability.yml). Try first, then sleep.
+          for i in {1..30}; do
             OUTPUT=$(./benchctl results "$RUN_ID" 2>&1) && break
             echo "Attempt $i: metrics not yet available, retrying..."
+            sleep 2
           done
           echo "$OUTPUT"
           echo "$OUTPUT" | grep -q "service:"

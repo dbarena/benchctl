@@ -2,6 +2,16 @@ name: Unit Tests
 
 on:
   pull_request:
+    branches: [main]
+  # Runs on main seed the shared Go cache: a cache written during a pull_request run is
+  # scoped to that PR and unreadable by any other, so without this every PR starts cold.
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs, but let main runs finish so they always seed the cache.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   unit-tests:
@@ -9,11 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: ./.github/actions/go-setup
 
       - name: Stage embed
         run: mise run stage-embed

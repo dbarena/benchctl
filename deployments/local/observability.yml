@@ -8,6 +8,10 @@ services:
     command:
       - -retentionPeriod=12
       - -storageDataPath=/storage
+      # Data is hidden from queries for this long after collection (default 30s), which
+      # is what "benchctl results" spends waiting right after a run. Benchmark samples
+      # are all pushed at once when the run ends, so there is no partial-data risk here.
+      - -search.latencyOffset=1s
     volumes:
       - vm-data:/storage
 
