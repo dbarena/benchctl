@@ -10,6 +10,7 @@ linters:
   default: none
   enable:
     - forbidigo
+    - govet
   settings:
     forbidigo:
       forbid:
@@ -25,3 +26,7 @@ linters:
         linters: [forbidigo]
       - path: '_test\.go$'
         linters: [forbidigo]
+
+formatters:
+  enable:
+    - gofmt

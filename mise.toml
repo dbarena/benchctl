@@ -1,5 +1,10 @@
+[settings]
+# Lets mise take the Go version from the `toolchain` directive in go.mod, so
+# go.mod stays the single source of truth. Off by default in mise.
+idiomatic_version_file_enable_tools = ["go"]
+
 [tools]
-go = "latest"
+# No `go` entry on purpose: the version comes from go.mod (see [settings] above).
 golangci-lint = "latest"
 
 [tasks.stage-embed]
@@ -78,18 +83,9 @@ description = "Print the current dev version string"
 run = "echo ${BENCHCTL_RELEASE_VERSION:-$(cat VERSION)+$(date +%Y%m%d)-$(git rev-parse --short HEAD)}"
 
 [tasks.lint]
-description = "Run gofmt -l, go vet, and golangci-lint"
+description = "Run golangci-lint (gofmt, govet, forbidigo)"
 depends = ["stage-embed"]
-run = """
-out=$(gofmt -l .)
-if [ -n "$out" ]; then
-  echo "gofmt: the following files need formatting:"
-  echo "$out"
-  exit 1
-fi
-go vet ./...
-golangci-lint run
-"""
+run = "golangci-lint run"
 
 [tasks.format]
 description = "Format all Go source files with gofmt"
