@@ -8,18 +8,21 @@ import (
 
 	"github.com/dbarena/benchctl/internal/config"
 	"github.com/dbarena/benchctl/internal/diagnostics"
+	awsdiag "github.com/dbarena/benchctl/internal/diagnostics/aws"
 	"github.com/dbarena/benchctl/internal/engine"
 	"github.com/dbarena/benchctl/internal/runstate"
 )
 
-// buildDiagnosticsCollector resolves a cloud vendor to a collector, mirroring
-// buildTargetProvider. A nil collector with a nil error means the vendor is
-// recognised but has no collector yet; the caller says so and moves on.
-func buildDiagnosticsCollector(_ *config.Config, vendor string) (diagnostics.Collector, error) {
+// buildDiagnosticsCollector resolves a vendor to a collector, mirroring
+// buildTargetProvider. A nil collector and nil error means the vendor is
+// recognised but has no collector yet.
+func buildDiagnosticsCollector(cfg *config.Config, vendor string) (diagnostics.Collector, error) {
 	switch vendor {
 	case "":
 		return nil, nil
-	case diagnostics.VendorAWS, diagnostics.VendorGCP, diagnostics.VendorSupabase:
+	case diagnostics.VendorAWS:
+		return awsdiag.New(cfg), nil
+	case diagnostics.VendorGCP, diagnostics.VendorSupabase:
 		// Implementations land one vendor at a time.
 		return nil, nil
 	default:
@@ -27,13 +30,11 @@ func buildDiagnosticsCollector(_ *config.Config, vendor string) (diagnostics.Col
 	}
 }
 
-// collectDiagnostics gathers provider-side data for a finished run into
-// <dest>/diagnostics.
+// collectDiagnostics gathers provider-side data into <dest>/diagnostics.
 //
-// It reports every problem and returns nil for all of them. `benchctl fetch`
-// must keep exiting 0: dbarenactl retries a failing fetch three times and then
-// stops the entire sweep, so a missing credential or an unsupported vendor
-// would take a whole benchmark sweep down with it.
+// It reports every problem and returns nil for all of them: `benchctl fetch`
+// must keep exiting 0, because dbarenactl stops a whole sweep after three
+// consecutive fetch failures.
 func collectDiagnostics(ctx context.Context, state *runstate.State, dest string) {
 	vendor := diagnostics.Vendor(state.TargetOutputs)
 	if vendor == "" {

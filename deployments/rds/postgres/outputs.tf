@@ -45,6 +45,11 @@ output "dbi_resource_id" {
   value       = aws_db_instance.this.resource_id
 }
 
+output "region" {
+  description = "AWS region this target runs in. Used e.g. for fetching diagnostics."
+  value       = var.region
+}
+
 output "vendor" {
   description = "Vendor this target runs on. Used e.g. for fetching diagnostics."
   value       = "aws"
