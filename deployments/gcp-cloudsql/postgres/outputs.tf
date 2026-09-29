@@ -50,6 +50,11 @@ output "sslmode" {
   value       = "require"
 }
 
+output "project_id" {
+  description = "GCP project the instance lives in. Used e.g. for fetching diagnostics."
+  value       = google_sql_database_instance.this.project
+}
+
 output "vendor" {
   description = "Vendor this target runs on. Used e.g. for fetching diagnostics."
   value       = "gcp"

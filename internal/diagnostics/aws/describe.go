@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/dbarena/benchctl/internal/diagnostics"
 )
@@ -17,7 +18,7 @@ import (
 // PendingModifiedValues means the scenario's configuration was not in effect.
 func (c *Collector) collectInstance(ctx context.Context, req diagnostics.Request, res *diagnostics.Result) []byte {
 	out, argv, err := c.run(ctx, "rds", "describe-db-instances", "--db-instance-identifier", c.instanceID)
-	if !c.save(res, req, req.Dest, "instance.json", argv, out, err) {
+	if !req.Save(res, req.Dest, "instance.json", argv, out, err) {
 		return nil
 	}
 	return out
@@ -29,11 +30,11 @@ func (c *Collector) collectInstance(ctx context.Context, req diagnostics.Request
 func (c *Collector) collectParameters(ctx context.Context, req diagnostics.Request, instance []byte, res *diagnostics.Result) {
 	group, err := parameterGroupName(instance)
 	if err != nil {
-		c.save(res, req, req.Dest, "parameters.json", "", nil, err)
+		req.Save(res, req.Dest, "parameters.json", "", nil, err)
 		return
 	}
 	out, argv, err := c.run(ctx, "rds", "describe-db-parameters", "--db-parameter-group-name", group)
-	c.save(res, req, req.Dest, "parameters.json", argv, out, err)
+	req.Save(res, req.Dest, "parameters.json", argv, out, err)
 }
 
 // parameterGroupName reads the group out of a describe-db-instances response
@@ -67,13 +68,13 @@ func parameterGroupName(instance []byte) (string, error) {
 // collectEvents captures the instance's event history over the run: backups
 // (which briefly suspend I/O on a single-AZ primary), storage autoscaling,
 // failovers, parameter applies.
-func (c *Collector) collectEvents(ctx context.Context, req diagnostics.Request, s span, res *diagnostics.Result) {
+func (c *Collector) collectEvents(ctx context.Context, req diagnostics.Request, start, end time.Time, res *diagnostics.Result) {
 	out, argv, err := c.run(ctx,
 		"rds", "describe-events",
 		"--source-type", "db-instance",
 		"--source-identifier", c.instanceID,
-		"--start-time", rfc3339(s.start),
-		"--end-time", rfc3339(s.end),
+		"--start-time", diagnostics.RFC3339(start),
+		"--end-time", diagnostics.RFC3339(end),
 	)
-	c.save(res, req, req.Dest, "events.json", argv, out, err)
+	req.Save(res, req.Dest, "events.json", argv, out, err)
 }

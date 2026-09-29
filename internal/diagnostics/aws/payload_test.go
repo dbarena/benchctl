@@ -206,7 +206,7 @@ func TestCollectLog_UsesMilliseconds(t *testing.T) {
 	req := testRequest(t)
 	var res diagnostics.Result
 
-	c.collectLog(context.Background(), req, span{start: winStart, end: winEnd}, &res)
+	c.collectLog(context.Background(), req, winStart, winEnd, &res)
 
 	call := f.call(t, "filter-log-events")
 	wantStart := strconv.FormatInt(winStart.UnixMilli(), 10)
@@ -228,7 +228,7 @@ func TestCollectLog_MissingGroupExplainsItself(t *testing.T) {
 	req := testRequest(t)
 	var res diagnostics.Result
 
-	c.collectLog(context.Background(), req, span{start: winStart, end: winEnd}, &res)
+	c.collectLog(context.Background(), req, winStart, winEnd, &res)
 
 	joined := strings.Join(res.Warnings, "; ")
 	if !strings.Contains(joined, "enabled_cloudwatch_logs_exports") {
@@ -319,21 +319,6 @@ func TestRenderLogEvents_ReportsPaginationCap(t *testing.T) {
 	}
 	if len(notes) != 1 || !strings.Contains(notes[0], "event cap") {
 		t.Errorf("notes = %v, want one about the event cap", notes)
-	}
-}
-
-func TestSpanOf(t *testing.T) {
-	windows := []diagnostics.Window{
-		{Start: winStart.Add(time.Hour), End: winStart.Add(2 * time.Hour)},
-		{Start: winStart, End: winStart.Add(30 * time.Minute)},
-		{Start: winStart.Add(3 * time.Hour), End: winStart.Add(4 * time.Hour)},
-	}
-	got := spanOf(windows)
-	if !got.start.Equal(winStart) {
-		t.Errorf("start = %s, want the earliest window start %s", got.start, winStart)
-	}
-	if want := winStart.Add(4 * time.Hour); !got.end.Equal(want) {
-		t.Errorf("end = %s, want the latest window end %s", got.end, want)
 	}
 }
 

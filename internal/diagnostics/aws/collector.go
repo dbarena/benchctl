@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"time"
 
 	"github.com/dbarena/benchctl/internal/config"
@@ -76,14 +74,16 @@ func (c *Collector) Preflight(req diagnostics.Request) error {
 // with Performance Insights off should still yield CloudWatch.
 func (c *Collector) Collect(ctx context.Context, req diagnostics.Request) (diagnostics.Result, error) {
 	var res diagnostics.Result
-	span := spanOf(req.Windows)
+	start, end := req.Span()
 
 	// Whole-run artifacts: anything not usefully sliced per window.
+	req.Reportf("instance configuration, parameters and event history")
 	instance := c.collectInstance(ctx, req, &res)
 	c.collectParameters(ctx, req, instance, &res)
-	c.collectEvents(ctx, req, span, &res)
+	c.collectEvents(ctx, req, start, end, &res)
 	c.collectPIMetadata(ctx, req, &res)
-	c.collectLog(ctx, req, span, &res)
+	req.Reportf("Postgres log from CloudWatch Logs")
+	c.collectLog(ctx, req, start, end, &res)
 
 	for _, w := range req.Windows {
 		dir, err := req.WindowDir(w)
@@ -91,6 +91,7 @@ func (c *Collector) Collect(ctx context.Context, req diagnostics.Request) (diagn
 			res.Warnings = append(res.Warnings, fmt.Sprintf("window %s: %v", w.Slug(), err))
 			continue
 		}
+		req.Reportf("CloudWatch and Performance Insights for window %s", w.Slug())
 		c.collectCloudWatch(ctx, req, w, dir, &res)
 		c.collectPILoad(ctx, req, w, dir, &res)
 		c.collectPITopSQL(ctx, req, w, dir, &res)
@@ -102,49 +103,3 @@ func (c *Collector) Collect(ctx context.Context, req diagnostics.Request) (diagn
 	}
 	return res, nil
 }
-
-// span covers every window. The Postgres log and the event history read
-// better as one continuous record than sliced per step.
-type span struct{ start, end time.Time }
-
-func spanOf(windows []diagnostics.Window) span {
-	var s span
-	for i, w := range windows {
-		if i == 0 || w.Start.Before(s.start) {
-			s.start = w.Start
-		}
-		if i == 0 || w.End.After(s.end) {
-			s.end = w.End
-		}
-	}
-	return s
-}
-
-// save writes one artifact and records it, or records why it could not.
-// Every step funnels through here so no failure is silent.
-func (c *Collector) save(res *diagnostics.Result, req diagnostics.Request, dir, name, argv string, data []byte, err error) bool {
-	rel := mustRel(req.Dest, filepath.Join(dir, name))
-	if err != nil {
-		res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", rel, err))
-		return false
-	}
-	if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
-		res.Warnings = append(res.Warnings, fmt.Sprintf("write %s: %v", rel, err))
-		return false
-	}
-	res.Artifacts = append(res.Artifacts, diagnostics.Artifact{File: rel, Command: argv})
-	return true
-}
-
-// mustRel renders a path relative to the diagnostics directory, falling back
-// to the absolute path: an ugly index entry beats losing the record.
-func mustRel(base, path string) string {
-	rel, err := filepath.Rel(base, path)
-	if err != nil {
-		return path
-	}
-	return rel
-}
-
-// rfc3339 is the format the pi, cloudwatch and rds CLIs accept.
-func rfc3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }

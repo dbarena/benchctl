@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -222,5 +223,60 @@ func TestIndexRoundTripsTimes(t *testing.T) {
 	}
 	if time.Since(idx.CollectedAt) > time.Minute {
 		t.Errorf("CollectedAt = %s, want roughly now", idx.CollectedAt)
+	}
+}
+
+// TestRequestSpan covers the interval whole-run sources use: the earliest
+// start and latest end across every window, not just the first.
+func TestRequestSpan(t *testing.T) {
+	req := Request{Windows: []Window{
+		{Start: t0.Add(time.Hour), End: t0.Add(2 * time.Hour)},
+		{Start: t0, End: t0.Add(30 * time.Minute)},
+		{Start: t0.Add(3 * time.Hour), End: t0.Add(4 * time.Hour)},
+	}}
+
+	start, end := req.Span()
+	if !start.Equal(t0) {
+		t.Errorf("start = %s, want the earliest window start %s", start, t0)
+	}
+	if want := t0.Add(4 * time.Hour); !end.Equal(want) {
+		t.Errorf("end = %s, want the latest window end %s", end, want)
+	}
+}
+
+// TestRequestSave_RecordsRelativePaths keeps index.json readable and portable:
+// an absolute path from the collecting machine is meaningless to a reader.
+func TestRequestSave_RecordsRelativePaths(t *testing.T) {
+	dest := t.TempDir()
+	req := Request{Dest: dest}
+	var res Result
+
+	sub := filepath.Join(dest, "benchmark_iter1")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if !req.Save(&res, sub, "cloudwatch.json", "aws cloudwatch get-metric-data", []byte("{}"), nil) {
+		t.Fatalf("Save reported failure: %v", res.Warnings)
+	}
+	if len(res.Artifacts) != 1 || res.Artifacts[0].File != filepath.Join("benchmark_iter1", "cloudwatch.json") {
+		t.Errorf("artifacts = %+v, want a path relative to Dest", res.Artifacts)
+	}
+}
+
+// TestRequestSave_UpstreamErrorBecomesAWarning verifies a failed source is
+// recorded rather than dropped, and writes nothing.
+func TestRequestSave_UpstreamErrorBecomesAWarning(t *testing.T) {
+	dest := t.TempDir()
+	req := Request{Dest: dest}
+	var res Result
+
+	if req.Save(&res, dest, "pi_db_load.json", "aws pi ...", nil, errors.New("AccessDenied")) {
+		t.Error("Save reported success for a failed source")
+	}
+	if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "AccessDenied") {
+		t.Errorf("warnings = %v, want the upstream error", res.Warnings)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "pi_db_load.json")); !os.IsNotExist(err) {
+		t.Error("a file was written for a failed source")
 	}
 }

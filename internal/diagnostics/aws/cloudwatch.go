@@ -102,27 +102,27 @@ func buildMetricDataQueries(instanceID string) ([]metricDataQuery, error) {
 func (c *Collector) collectCloudWatch(ctx context.Context, req diagnostics.Request, w diagnostics.Window, dir string, res *diagnostics.Result) {
 	queries, err := buildMetricDataQueries(c.instanceID)
 	if err != nil {
-		c.save(res, req, dir, "cloudwatch.json", "", nil, err)
+		req.Save(res, dir, "cloudwatch.json", "", nil, err)
 		return
 	}
 	payload, err := json.Marshal(queries)
 	if err != nil {
-		c.save(res, req, dir, "cloudwatch.json", "", nil, err)
+		req.Save(res, dir, "cloudwatch.json", "", nil, err)
 		return
 	}
 
 	out, argv, err := c.run(ctx,
 		"cloudwatch", "get-metric-data",
 		"--metric-data-queries", string(payload),
-		"--start-time", rfc3339(w.Start),
-		"--end-time", rfc3339(w.End),
+		"--start-time", diagnostics.RFC3339(w.Start),
+		"--end-time", diagnostics.RFC3339(w.End),
 		// The CLI defaults to descending.
 		"--scan-by", "TimestampAscending",
 	)
 	if err == nil {
 		err = warnOnPartialMetricData(out, res)
 	}
-	c.save(res, req, dir, "cloudwatch.json", argv, out, err)
+	req.Save(res, dir, "cloudwatch.json", argv, out, err)
 }
 
 // warnOnPartialMetricData surfaces per-query status from an otherwise
