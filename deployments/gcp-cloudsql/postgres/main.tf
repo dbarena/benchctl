@@ -196,7 +196,9 @@ resource "google_sql_database_instance" "this" {
 
     database_flags {
       name  = "log_min_duration_statement"
-      value = "1000" # ms; slow-query visibility without connection/lock-wait noise
+    # ms. 1000 would log go-tpc's bulk-load INSERTs during data loading, just adding noise to the logs.
+    # 5000 keeps genuine benchmark-phase anomalies.
+      value = "5000"
     }
 
     user_labels = var.tags
