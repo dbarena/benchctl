@@ -37,3 +37,8 @@ output "ssh_user" {
   description = "SSH username for the target instance. Determined by the Ubuntu 24.04 LTS AMI."
   value       = "ubuntu"
 }
+
+output "vendor" {
+  description = "Vendor this target runs on. Used e.g. for fetching diagnostics."
+  value       = "aws"
+}

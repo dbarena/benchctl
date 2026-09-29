@@ -49,3 +49,8 @@ output "sslmode" {
   description = "Forces TLS on all connections."
   value       = "require"
 }
+
+output "vendor" {
+  description = "Vendor this target runs on. Used e.g. for fetching diagnostics."
+  value       = "gcp"
+}
