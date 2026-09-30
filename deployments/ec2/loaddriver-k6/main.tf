@@ -137,14 +137,13 @@ resource "aws_security_group" "driver" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
   tags = merge(var.tags, { Name = "${local.name}-driver" })
+}
+
+resource "aws_vpc_security_group_egress_rule" "driver_all" {
+  security_group_id = aws_security_group.driver.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
 }
 
 # ── User data ─────────────────────────────────────────────────────────────────
