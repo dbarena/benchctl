@@ -894,7 +894,7 @@ func (p *Provider) resizeDiskIfNeeded(ctx context.Context, dbHost, ref string, s
 	if token == "" {
 		return fmt.Errorf("resize disk: no access token (set BENCHCTL_SUPABASE_ACCESS_TOKEN)")
 	}
-	url := "https://" + managementAPIHost(dbHost) + "/v1/projects/" + ref + "/config/disk"
+	url := "https://" + ManagementAPIHost(dbHost) + "/v1/projects/" + ref + "/config/disk"
 
 	current, err := p.getDiskAttrs(ctx, url, token)
 	if err != nil {
@@ -998,7 +998,7 @@ func (p *Provider) getDiskAttrs(ctx context.Context, url, token string) (diskAtt
 	return diskAttrs{SizeGB: v.Attributes.SizeGB, IOPS: v.Attributes.IOPS, Type: v.Attributes.Type}, nil
 }
 
-// managementAPIHost derives the Management API host from the project's direct
+// ManagementAPIHost derives the Management API host from the project's direct
 // DB host domain, the same way poolerHost derives the pooler domain. This
 // avoids hardcoding a single (production) host and silently calling the wrong
 // environment's disk API when a scenario targets a non-default --profile.
@@ -1006,7 +1006,7 @@ func (p *Provider) getDiskAttrs(ctx context.Context, url, token string) (diskAtt
 // Production: db.abc.supabase.co  → api.supabase.com
 // Staging:    db.abc.supabase.red → api.supabase.green (confirmed live against
 // a staging project during implementation)
-func managementAPIHost(dbHost string) string {
+func ManagementAPIHost(dbHost string) string {
 	parts := strings.SplitN(dbHost, ".", 3)
 	directDomain := ""
 	if len(parts) == 3 {

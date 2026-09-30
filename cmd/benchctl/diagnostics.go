@@ -10,6 +10,7 @@ import (
 	"github.com/dbarena/benchctl/internal/diagnostics"
 	awsdiag "github.com/dbarena/benchctl/internal/diagnostics/aws"
 	gcpdiag "github.com/dbarena/benchctl/internal/diagnostics/gcp"
+	supabasediag "github.com/dbarena/benchctl/internal/diagnostics/supabase"
 	"github.com/dbarena/benchctl/internal/engine"
 	"github.com/dbarena/benchctl/internal/runstate"
 )
@@ -26,8 +27,7 @@ func buildDiagnosticsCollector(cfg *config.Config, vendor string) (diagnostics.C
 	case diagnostics.VendorGCP:
 		return gcpdiag.New(cfg), nil
 	case diagnostics.VendorSupabase:
-		// Implementations land one vendor at a time.
-		return nil, nil
+		return supabasediag.New(cfg), nil
 	default:
 		return nil, fmt.Errorf("unsupported diagnostics collector %q", vendor)
 	}

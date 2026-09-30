@@ -372,22 +372,22 @@ func TestParseConfig_DiskType_Invalid(t *testing.T) {
 	}
 }
 
-// --- managementAPIHost ---
+// --- ManagementAPIHost ---
 
 func TestManagementAPIHost_Production(t *testing.T) {
-	if got := managementAPIHost("db.abc123.supabase.co"); got != "api.supabase.com" {
+	if got := ManagementAPIHost("db.abc123.supabase.co"); got != "api.supabase.com" {
 		t.Errorf("got %q, want api.supabase.com", got)
 	}
 }
 
 func TestManagementAPIHost_Staging(t *testing.T) {
-	if got := managementAPIHost("db.abc123.supabase.red"); got != "api.supabase.green" {
+	if got := ManagementAPIHost("db.abc123.supabase.red"); got != "api.supabase.green" {
 		t.Errorf("got %q, want api.supabase.green", got)
 	}
 }
 
 func TestManagementAPIHost_UnknownDomainFallsBackToProduction(t *testing.T) {
-	if got := managementAPIHost("db.abc123.example.net"); got != "api.supabase.com" {
+	if got := ManagementAPIHost("db.abc123.example.net"); got != "api.supabase.com" {
 		t.Errorf("got %q, want api.supabase.com (fallback)", got)
 	}
 }
