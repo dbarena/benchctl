@@ -127,14 +127,13 @@ resource "aws_security_group" "target" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
   tags = merge(var.tags, { Name = "${local.name}-target" })
+}
+
+resource "aws_vpc_security_group_egress_rule" "target_all" {
+  security_group_id = aws_security_group.target.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
 }
 
 # ── SSH key pair ──────────────────────────────────────────────────────────────
