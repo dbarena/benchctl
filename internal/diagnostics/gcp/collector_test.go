@@ -66,8 +66,13 @@ func newFakeAPI(t *testing.T, handler func(*recordedRequest) (int, string)) *fak
 	return f
 }
 
+// noopCheckCLI bypasses the PATH lookup so these tests do not depend on
+// whether the host has gcloud installed.
+func noopCheckCLI() error { return nil }
+
 func (f *fakeAPI) collector() *Collector {
 	return &Collector{
+		checkCLI:       noopCheckCLI,
 		doer:           f.server.Client(),
 		token:          func(context.Context) (string, error) { return "test-token", nil },
 		quotaProject:   func() string { return "quota-proj" },
@@ -338,6 +343,7 @@ func TestPreflight(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := New(nil)
+			c.checkCLI = noopCheckCLI
 			c.token = tt.token
 			err := c.Preflight(diagnostics.Request{Outputs: tt.outputs})
 			if err == nil {
@@ -352,6 +358,7 @@ func TestPreflight(t *testing.T) {
 
 func TestPreflight_ResolvesDatabaseID(t *testing.T) {
 	c := New(nil)
+	c.checkCLI = noopCheckCLI
 	c.token = func(context.Context) (string, error) { return "t", nil }
 
 	if err := c.Preflight(diagnostics.Request{Outputs: map[string]string{
