@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"time"
 
 	"github.com/dbarena/benchctl/internal/config"
@@ -21,6 +20,9 @@ const (
 
 // Collector implements diagnostics.Collector for AWS targets.
 type Collector struct {
+	// checkCLI overrides the PATH lookup in Preflight; nil uses the real one.
+	checkCLI func() error
+
 	exec cmdRunner
 
 	// Resolved once in Preflight so the per-source methods need not
@@ -42,8 +44,8 @@ func (c *Collector) Name() string { return diagnostics.VendorAWS }
 // Preflight resolves the identifiers and checks prerequisites once, so a
 // missing CLI or credential yields one message rather than a dozen.
 func (c *Collector) Preflight(req diagnostics.Request) error {
-	if _, err := exec.LookPath("aws"); err != nil {
-		return errors.New("the aws CLI is not on PATH")
+	if err := c.requireCLI(); err != nil {
+		return err
 	}
 
 	c.region = req.Outputs[outputRegion]
@@ -102,4 +104,13 @@ func (c *Collector) Collect(ctx context.Context, req diagnostics.Request) (diagn
 		return res, errors.New("every AWS source failed; see the warnings above")
 	}
 	return res, nil
+}
+
+// checkCLI is injected so tests do not depend on whether the host has the
+// CLI installed. Nil means use the real PATH lookup.
+func (c *Collector) requireCLI() error {
+	if c.checkCLI != nil {
+		return c.checkCLI()
+	}
+	return diagnostics.RequireCLI("aws")
 }

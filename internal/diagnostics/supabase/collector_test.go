@@ -299,6 +299,7 @@ func TestPreflight(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := New(tt.cfg)
+			c.checkCLI = noopCheckCLI
 			err := c.Preflight(diagnostics.Request{Outputs: tt.outputs})
 			if err == nil {
 				t.Fatal("expected an error")
@@ -382,3 +383,9 @@ func TestConfigSnapshots_EachHasAReason(t *testing.T) {
 		t.Error("disk.json is missing; it is the only source of provisioned IOPS")
 	}
 }
+
+// noopCheckCLI bypasses the PATH lookup so these tests exercise the
+// identifier and token checks rather than whether the host has the supabase
+// CLI installed. Without it they pass on a developer machine and fail on a CI
+// runner, which is exactly what happened.
+func noopCheckCLI() error { return nil }

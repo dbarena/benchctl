@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os/exec"
 
 	"github.com/dbarena/benchctl/internal/config"
 	"github.com/dbarena/benchctl/internal/diagnostics"
@@ -20,6 +19,9 @@ const (
 
 // Collector implements diagnostics.Collector for Supabase targets.
 type Collector struct {
+	// checkCLI overrides the PATH lookup in Preflight; nil uses the real one.
+	checkCLI func() error
+
 	doer httpDoer
 	run  cmdRunner
 	cfg  *config.Config
@@ -47,8 +49,8 @@ func (c *Collector) Name() string { return diagnostics.VendorSupabase }
 
 // Preflight resolves the project identifiers and the access token once.
 func (c *Collector) Preflight(req diagnostics.Request) error {
-	if _, err := exec.LookPath("supabase"); err != nil {
-		return errors.New("the supabase CLI is not on PATH")
+	if err := c.requireCLI(); err != nil {
+		return err
 	}
 
 	c.projectRef = req.Outputs[outputProjectRef]
@@ -89,4 +91,13 @@ func (c *Collector) Collect(ctx context.Context, req diagnostics.Request) (diagn
 		return res, errors.New("every Supabase source failed; see the warnings above")
 	}
 	return res, nil
+}
+
+// checkCLI is injected so tests do not depend on whether the host has the
+// CLI installed. Nil means use the real PATH lookup.
+func (c *Collector) requireCLI() error {
+	if c.checkCLI != nil {
+		return c.checkCLI()
+	}
+	return diagnostics.RequireCLI("supabase")
 }

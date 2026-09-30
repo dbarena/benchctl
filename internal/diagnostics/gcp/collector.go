@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os/exec"
 	"time"
 
 	"github.com/dbarena/benchctl/internal/config"
@@ -22,6 +21,9 @@ const (
 
 // Collector implements diagnostics.Collector for Google Cloud targets.
 type Collector struct {
+	// checkCLI overrides the PATH lookup in Preflight; nil uses the real one.
+	checkCLI func() error
+
 	doer  httpDoer
 	token tokenSource
 	// quotaProject names the project API quota is billed to; see
@@ -60,8 +62,8 @@ func (c *Collector) Name() string { return diagnostics.VendorGCP }
 // Preflight resolves the identifiers and checks prerequisites once, so a
 // missing credential yields one message rather than one per source.
 func (c *Collector) Preflight(req diagnostics.Request) error {
-	if _, err := exec.LookPath("gcloud"); err != nil {
-		return errors.New("gcloud is not on PATH; it is needed to mint an access token")
+	if err := c.requireCLI(); err != nil {
+		return err
 	}
 
 	c.projectID = req.Outputs[outputProjectID]
@@ -109,4 +111,13 @@ func (c *Collector) Collect(ctx context.Context, req diagnostics.Request) (diagn
 		return res, errors.New("every Google Cloud source failed; see the warnings above")
 	}
 	return res, nil
+}
+
+// checkCLI is injected so tests do not depend on whether the host has the
+// CLI installed. Nil means use the real PATH lookup.
+func (c *Collector) requireCLI() error {
+	if c.checkCLI != nil {
+		return c.checkCLI()
+	}
+	return diagnostics.RequireCLI("gcloud")
 }

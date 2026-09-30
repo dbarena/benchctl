@@ -107,8 +107,14 @@ func allResponses() map[string]string {
 
 func newTestCollector(t *testing.T, f *fakeAWS) *Collector {
 	t.Helper()
-	return &Collector{exec: f.run, region: "eu-central-1", instanceID: "bench-pg", resourceID: "db-ABC"}
+	return &Collector{exec: f.run, checkCLI: noopCheckCLI, region: "eu-central-1", instanceID: "bench-pg", resourceID: "db-ABC"}
 }
+
+// noopCheckCLI bypasses the PATH lookup so these tests do not depend on
+// whether the host has the aws CLI installed. The GitHub runner happens to
+// ship it, which hid this dependency until the sibling Supabase collector
+// failed on the same pattern.
+func noopCheckCLI() error { return nil }
 
 func testRequest(t *testing.T) diagnostics.Request {
 	t.Helper()
@@ -314,7 +320,7 @@ func TestPreflight_RequiresIdentifiers(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Collector{exec: (&fakeAWS{t: t, responses: allResponses()}).run}
+			c := &Collector{exec: (&fakeAWS{t: t, responses: allResponses()}).run, checkCLI: noopCheckCLI}
 			err := c.Preflight(diagnostics.Request{Outputs: tt.outputs})
 			if err == nil {
 				t.Fatal("expected an error")

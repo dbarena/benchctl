@@ -280,3 +280,19 @@ func TestRequestSave_UpstreamErrorBecomesAWarning(t *testing.T) {
 		t.Error("a file was written for a failed source")
 	}
 }
+
+// TestRequireCLI covers the check collectors reach through an injectable
+// field. It is the only place in the diagnostics packages that touches PATH,
+// and keeping it here is what lets every collector's Preflight test stay
+// hermetic.
+func TestRequireCLI(t *testing.T) {
+	if err := RequireCLI("no-such-binary-abc123"); err == nil {
+		t.Error("expected an error for a binary that is not on PATH")
+	} else if !strings.Contains(err.Error(), "no-such-binary-abc123") {
+		t.Errorf("error does not name the binary: %v", err)
+	}
+	// go is on PATH wherever these tests can run at all.
+	if err := RequireCLI("go"); err != nil {
+		t.Errorf("RequireCLI(go): %v", err)
+	}
+}

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -131,6 +132,20 @@ func (r Request) rel(path string) string {
 		return path
 	}
 	return out
+}
+
+// RequireCLI reports whether bin is on PATH, with a message naming it.
+//
+// Collectors reach it through an injectable field rather than calling it
+// directly: a Preflight that runs the real lookup makes its own unit tests
+// depend on whether the host happens to have that CLI installed, which is how
+// the Supabase collector's tests passed locally and failed on a CI runner
+// without the supabase binary.
+func RequireCLI(bin string) error {
+	if _, err := exec.LookPath(bin); err != nil {
+		return fmt.Errorf("the %s CLI is not on PATH", bin)
+	}
+	return nil
 }
 
 // RFC3339 is the timestamp format the AWS and Google APIs accept.
