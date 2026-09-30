@@ -131,11 +131,3 @@ run = "docker compose -f deployments/local/observability.yml down"
 description = "Stop local VictoriaMetrics + Grafana stack and delete all stored metrics (down -v)"
 run = "docker compose -f deployments/local/observability.yml down -v"
 
-[tasks.test-integration]
-description = "Run integration tests against the local observability stack (starts and stops it automatically)"
-depends = ["stage-embed"]
-run = """
-docker compose -f deployments/local/observability.yml up -d
-go test -tags integration ./...
-docker compose -f deployments/local/observability.yml down -v
-"""
