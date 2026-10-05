@@ -53,9 +53,9 @@ func TestIsNewFormatKey(t *testing.T) {
 		key  string
 		want bool
 	}{
-		{"sb_secret_B2xaRorKNTy3twgitoxF0Q_qhyYJaTr", true},
+		{"sb_secret_B2_test_key_new_format", true},
 		{"sb_publishable_abc123", true},
-		{"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig", false},
+		{"abcTest.payload.sig", false},
 		{"", false},
 		{"service_role", false},
 	}
@@ -71,7 +71,7 @@ func TestIsNewFormatKey(t *testing.T) {
 // apikey: anonKey. This is the regression that caused PGRST301 "Expected 3
 // parts in JWT; got 1" when a service role key in the new format was used.
 func TestDoRequestHeaders(t *testing.T) {
-	const anonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.anon.sig"
+	const anonKey = "abcTest.anon.sig"
 
 	tests := []struct {
 		name           string
@@ -81,8 +81,8 @@ func TestDoRequestHeaders(t *testing.T) {
 	}{
 		{
 			name:           "new-format secret key goes to apikey only",
-			authToken:      "sb_secret_B2xaRorKNTy3twgitoxF0Q_qhyYJaTr",
-			wantAPIKey:     "sb_secret_B2xaRorKNTy3twgitoxF0Q_qhyYJaTr",
+			authToken:      "sb_secret_B2_test_key_new_format",
+			wantAPIKey:     "sb_secret_B2_test_key_new_format",
 			wantAuthBearer: "",
 		},
 		{
@@ -93,9 +93,9 @@ func TestDoRequestHeaders(t *testing.T) {
 		},
 		{
 			name:           "legacy JWT uses Authorization Bearer and anonKey as apikey",
-			authToken:      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.user.sig",
+			authToken:      "abcTest.user.sig",
 			wantAPIKey:     anonKey,
-			wantAuthBearer: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.user.sig",
+			wantAuthBearer: "Bearer abcTest.user.sig",
 		},
 	}
 
