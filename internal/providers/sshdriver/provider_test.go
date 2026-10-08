@@ -24,6 +24,11 @@ func installFakeTofu(t *testing.T, exitCodes map[string]int) {
 		t.Skip("fake tofu script requires a POSIX shell")
 	}
 
+	// Provision roots its work dir under $HOME (tofustate.RunDir). Isolate it so
+	// tests in other packages that run concurrently and share the same run ID
+	// cannot clobber this test's files.
+	t.Setenv("HOME", t.TempDir())
+
 	dir := t.TempDir()
 	script := "#!/bin/sh\ncase \"$1\" in\n"
 	for cmd, code := range exitCodes {
