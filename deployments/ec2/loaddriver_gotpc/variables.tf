@@ -55,8 +55,8 @@ variable "region" {
 
 variable "ami" {
   # Pinned per region to Ubuntu 24.04 LTS arm64 hvm:ebs-gp3.
-  # eu-central-1, build 20260904
-  # us-east-1, build 20260904
+  # eu-central-1, build 20261004
+  # us-east-1, build 20261004
   # Update via the update-ami workflow or query manually:
   #   aws ec2 describe-images --region <region> --owners 099720109477 \
   #     --filters "Name=name,Values=ubuntu/images/hvm-ssd*/ubuntu-noble-24.04-arm64-server-*" \
@@ -65,8 +65,8 @@ variable "ami" {
   description = "AMI ID per region. Pinned to a specific Ubuntu 24.04 LTS ARM64 build; update via the update-ami workflow."
   type        = map(string)
   default = {
-    "eu-central-1" = "ami-0e79e661e73ddfac9"
-    "us-east-1" = "ami-0246d714afcc1d494"
+    "eu-central-1" = "ami-0acc733af7bf42eeb"
+    "us-east-1" = "ami-0e1ab5c876cc030e8"
   }
 }
 
