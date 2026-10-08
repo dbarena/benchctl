@@ -81,7 +81,8 @@ func TestSummarizeCloudInitErrors(t *testing.T) {
 // WaitForCloudInit can be tested without a host. The script branches on the
 // remote command, which is always ssh's last argument: the `status --wait`
 // call exits with $FAKE_SSH_WAIT_EXIT, and the follow-up diagnostics call
-// prints $FAKE_SSH_DIAG. Mirrors installFakeTofu in the opentofu provider
+// prints $FAKE_SSH_DIAG. The first $FAKE_SSH_WAIT_DROPS `status --wait` calls
+// exit 255 like ssh does when sshd resets the connection. Mirrors installFakeTofu in the opentofu provider
 // tests.
 func installFakeSSH(t *testing.T) {
 	t.Helper()
@@ -93,6 +94,14 @@ func installFakeSSH(t *testing.T) {
 for a in "$@"; do last="$a"; done
 case "$last" in
   *"status --wait"*)
+    if [ -n "$FAKE_SSH_WAIT_DROPS" ]; then
+      n=$(cat "$0.drops" 2>/dev/null || echo 0)
+      if [ "$n" -lt "$FAKE_SSH_WAIT_DROPS" ]; then
+        echo $((n + 1)) > "$0.drops"
+        echo "Connection reset by 10.0.0.1 port 22" >&2
+        exit 255
+      fi
+    fi
     if [ -n "$FAKE_SSH_WAIT_SLEEP" ]; then sleep "$FAKE_SSH_WAIT_SLEEP"; fi
     echo "status: error"
     exit "${FAKE_SSH_WAIT_EXIT:-0}"
@@ -199,5 +208,48 @@ func TestWaitForCloudInit_TimeoutIsDistinguished(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "exit status") {
 		t.Errorf("timeout error reports an exit status, which describes ssh's cancellation rather than cloud-init: %v", err)
+	}
+}
+
+// shortenSSHRetryInterval keeps the retry tests fast.
+func shortenSSHRetryInterval(t *testing.T) {
+	t.Helper()
+	prev := cloudInitSSHRetryInterval
+	cloudInitSSHRetryInterval = time.Millisecond
+	t.Cleanup(func() { cloudInitSSHRetryInterval = prev })
+}
+
+// TestWaitForCloudInit_RetriesDroppedConnection is the regression guard for a
+// nightly run that failed with "cloud-init failed: exit status 255": sshd
+// reset the first connection while cloud-init was still booting, and the
+// diagnostics a few seconds later showed cloud-init running with no errors.
+func TestWaitForCloudInit_RetriesDroppedConnection(t *testing.T) {
+	installFakeSSH(t)
+	shortenSSHRetryInterval(t)
+	t.Setenv("FAKE_SSH_WAIT_DROPS", "2")
+
+	var out bytes.Buffer
+	if err := WaitForCloudInit(context.Background(), &out, "", "ubuntu", "10.0.0.1", time.Minute); err != nil {
+		t.Fatalf("WaitForCloudInit: %v", err)
+	}
+	if got := strings.Count(out.String(), "retrying"); got != 2 {
+		t.Errorf("got %d retry messages, want 2; output: %q", got, out.String())
+	}
+}
+
+// TestWaitForCloudInit_PersistentSSHFailureGivesUp covers an ssh failure that
+// does not go away, such as a wrong key. It must fail as an ssh failure after
+// a bounded number of attempts rather than retry until the timeout.
+func TestWaitForCloudInit_PersistentSSHFailureGivesUp(t *testing.T) {
+	installFakeSSH(t)
+	shortenSSHRetryInterval(t)
+	t.Setenv("FAKE_SSH_WAIT_DROPS", "1000")
+
+	err := WaitForCloudInit(context.Background(), nil, "", "ubuntu", "10.0.0.1", time.Minute)
+	if err == nil {
+		t.Fatal("WaitForCloudInit succeeded although ssh always failed")
+	}
+	if !strings.Contains(err.Error(), "exit status 255") {
+		t.Errorf("error does not report the ssh failure: %v", err)
 	}
 }

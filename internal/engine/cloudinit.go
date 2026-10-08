@@ -29,6 +29,22 @@ const cloudInitDiagnosticsTimeout = 30 * time.Second
 // lines are the commands leading up to the failure.
 const cloudInitOutputLogTail = 40
 
+// sshExitConnectionFailed is the exit code ssh reserves for its own failures,
+// as opposed to the remote command's exit code. During early boot, sshd can
+// accept a TCP connection and then reset it while cloud-init regenerates host
+// keys, so the first `status --wait` call can fail this way on a healthy
+// instance.
+const sshExitConnectionFailed = 255
+
+// cloudInitSSHAttempts bounds how often the wait reconnects after ssh itself
+// fails. Bounded so that a persistent problem, such as a wrong key, surfaces
+// as an ssh failure within a minute rather than as a timeout much later.
+const cloudInitSSHAttempts = 12
+
+// cloudInitSSHRetryInterval is the pause between those attempts. A variable so
+// that tests can shorten it.
+var cloudInitSSHRetryInterval = 5 * time.Second
+
 // WaitForCloudInit blocks until cloud-init finishes on host and reports
 // whether the instance came up usable.
 //
@@ -39,7 +55,7 @@ const cloudInitOutputLogTail = 40
 // anything is to SSH into an instance teardown is about to destroy.
 func WaitForCloudInit(ctx context.Context, out io.Writer, keyPath, user, host string, timeout time.Duration) error {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	err := RunSSH(waitCtx, out, keyPath, user, host, "cloud-init status --wait")
+	err := runCloudInitWait(waitCtx, out, keyPath, user, host)
 	timedOut := errors.Is(waitCtx.Err(), context.DeadlineExceeded)
 	cancel()
 
@@ -61,6 +77,28 @@ func WaitForCloudInit(ctx context.Context, out io.Writer, keyPath, user, host st
 		return fmt.Errorf("cloud-init failed on %s: %s: %w", host, detail, err)
 	}
 	return fmt.Errorf("cloud-init failed on %s: %w", host, err)
+}
+
+// runCloudInitWait runs `cloud-init status --wait` on host and reconnects when
+// ssh itself fails, up to cloudInitSSHAttempts times. It returns the error of
+// the last attempt.
+func runCloudInitWait(ctx context.Context, out io.Writer, keyPath, user, host string) error {
+	var err error
+	for attempt := 1; attempt <= cloudInitSSHAttempts; attempt++ {
+		err = RunSSH(ctx, out, keyPath, user, host, "cloud-init status --wait")
+		if sshExitCode(err) != sshExitConnectionFailed || attempt == cloudInitSSHAttempts {
+			return err
+		}
+		if out != nil {
+			fmt.Fprintf(out, "  cloud-init: ssh connection to %s failed; retrying (attempt %d of %d)\n", host, attempt+1, cloudInitSSHAttempts)
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(cloudInitSSHRetryInterval):
+		}
+	}
+	return err
 }
 
 // cloudInitFailureDetail prints why cloud-init failed and returns a one-line
