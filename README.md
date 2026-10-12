@@ -14,13 +14,13 @@ Authenticate via `supabase login` or set `BENCHCTL_SUPABASE_ACCESS_TOKEN` to a p
 
 ## Install
 
-### From a release
+### From the dev release
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dbarena/benchctl/main/scripts/install.sh | sh
 ```
 
-Installs to `/usr/local/bin/benchctl`. State and cached artifacts live under `~/.benchctl`.
+Installs the rolling `dev` build of `main` to `/usr/local/bin/benchctl`. State and cached artifacts live under `~/.benchctl`.
 
 ### From source
 

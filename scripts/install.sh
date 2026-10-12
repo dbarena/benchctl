@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs the latest tagged benchctl release for this machine's OS/arch.
+# Installs the rolling dev build of benchctl (built from main) for this machine's OS/arch.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/dbarena/benchctl/main/scripts/install.sh | sh
@@ -30,17 +30,22 @@ case "$arch" in
 esac
 
 asset="benchctl-${os}-${arch}"
-base_url="https://github.com/${repo}/releases/latest/download"
+base_url="https://github.com/${repo}/releases/download/dev"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-echo "==> downloading ${asset} from the latest ${repo} release"
+echo "==> downloading ${asset} from the ${repo} dev release"
 curl -fsSL --retry 5 --retry-delay 10 -o "$tmp/$asset" "${base_url}/${asset}"
 curl -fsSL --retry 5 --retry-delay 10 -o "$tmp/checksums.txt" "${base_url}/checksums.txt"
 
 echo "==> verifying checksum"
-(cd "$tmp" && grep " ${asset}\$" checksums.txt | sha256sum -c -)
+if command -v sha256sum >/dev/null 2>&1; then
+  sha_check="sha256sum -c -"
+else
+  sha_check="shasum -a 256 -c -"
+fi
+(cd "$tmp" && grep " ${asset}\$" checksums.txt | $sha_check)
 
 chmod +x "$tmp/$asset"
 
