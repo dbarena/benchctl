@@ -6,7 +6,7 @@ benchctl pushes benchmark metrics (TPM, latency percentiles, run info) to Victor
 
 ### VictoriaMetrics
 
-Set the config keys in `~/.benchctl/config.yaml` with `benchctl config set`, e.g. `benchctl config set metrics.endpoint <url>`. The two secrets have no config key and come only from the environment.
+If your benchctl was distributed with a shared configuration, it may already set the config keys below (`benchctl config show` can tell you where values are set). Otherwise set them in the home configuration (`~/.benchctl/config.yaml`) with `benchctl config set`, e.g. `benchctl config set metrics.endpoint <url>`. A key set in the home configuration will override the key in the shared configuration. The two secrets have no config key and come only from the environment.
 
 | Config key | Env var | Purpose |
 |---|---|---|

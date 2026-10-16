@@ -50,6 +50,25 @@ Caveats:
 - **Source the script, do not execute it.** `source scripts/use.sh` or `. scripts/use.sh`.
 - The shim affects only your *current* shell session. Put the `source` line in your shell's rc file to keep it across sessions.
 
+## Configuration
+
+benchctl resolves each setting on its own from four layers. The first layer that has a value wins:
+
+| # | Layer | Where | Set by |
+|---|---|---|---|
+| 1 | **Environment variables** | `BENCHCTL_*`, e.g. `BENCHCTL_STORE_MODE` | your shell, CI, remote drivers |
+| 2 | **Home configuration** | `~/.benchctl/config.yaml` | you, with `benchctl config set` / `unset` |
+| 3 | **Shared configuration** | `<prefix>/share/benchctl/config.yaml` | whoever distributes benchctl to you, if anyone |
+| 4 | **Default configuration** | built into benchctl | benchctl |
+
+Why a shared configuration as well as a home one? The shared configuration lets whoever distributes benchctl to a group of users give them all the same settings, such as a common remote state store and metrics endpoint, by shipping a file alongside the benchctl binary, for example in a package. Users don't copy anything into their own files, so a changed value in the shared configuration reaches everyone in the next update. The home configuration holds what each person chooses for themselves, and overrides the shared configuration key by key. If you do not use a shared configuration, then you can just rely on the home and default configurations.
+
+- Credentials (tokens, passwords, the service-role key) come only from environment variables, never put them in a shared configuration.
+- `BENCHCTL_CONFIG_FILE` moves the home configuration elsewhere.
+- benchctl finds the shared configuration at `../share/benchctl/config.yaml` relative to its binary, after resolving symlinks, so a package that installs `bin/benchctl` can install the file next to it. This path can be overridden with `BENCHCTL_SHARED_CONFIG_FILE`.
+
+`benchctl config show` prints every effective setting and the layer it comes from. It flags home configuration values that override the shared configuration. You can use `benchctl config unset <key>` to remove specific home configuration values, or `--overrides-shared` to remove them all and use all the values from the shared configuration file.
+
 ## Quick start
 
 Run scenarios locally with Docker Compose for smoke tests and tool validation.
@@ -180,7 +199,7 @@ Monitor, connect, and tear down exactly as in the EC2 workflow above (`benchctl 
 | `benchctl validate <scenario>` | Validate a scenario file without running it |
 | `benchctl info <scenario> [--set key=value]` | Show a scenario's inputs, fixtures, and benchmark steps; `--set` previews the effect of overrides |
 | `benchctl results <run-id>` | Render a per-transaction summary table |
-| `benchctl auth login` | Authenticate to shared Supabase state store with GitHub SSO (optional) |
+| `benchctl auth login` | Authenticate to the remote Supabase state store with GitHub SSO (optional) |
 | `benchctl auth status` | Verify auth and state store access |
 | `benchctl providers list` | List available providers and adapters |
 | `benchctl purge <run-id>` | Delete a run from the state store |

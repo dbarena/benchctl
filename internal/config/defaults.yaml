@@ -1,0 +1,6 @@
+# Default configuration, compiled into the binary: the lowest-priority layer.
+# A value here applies only when no environment variable, home configuration
+# (~/.benchctl/config.yaml) or shared configuration sets the key.
+store:
+  mode: local
+  refresh_interval: 30s

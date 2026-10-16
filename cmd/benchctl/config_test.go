@@ -22,6 +22,7 @@ func setConfigFile(t *testing.T) string {
 		"BENCHCTL_STORE_MODE",
 		"BENCHCTL_STORE_URL",
 		"BENCHCTL_STORE_ANON_KEY",
+		"BENCHCTL_STORE_REFRESH_INTERVAL",
 		"BENCHCTL_STORE_SERVICE_ROLE_KEY",
 		"BENCHCTL_STORE_AUTH_TOKEN",
 		"BENCHCTL_METRICS_ENDPOINT",
@@ -30,6 +31,7 @@ func setConfigFile(t *testing.T) string {
 		"BENCHCTL_METRICS_PASSWORD",
 		"BENCHCTL_SUPABASE_ACCESS_TOKEN",
 		"BENCHCTL_USERNAME",
+		"BENCHCTL_SHARED_CONFIG_FILE",
 	} {
 		t.Setenv(name, "")
 	}
@@ -67,7 +69,7 @@ func TestRunConfigSet_ValidKeys(t *testing.T) {
 	}{
 		{"store.url", "https://example.supabase.co"},
 		{"store.anon_key", "anon-123"},
-		{"tags.org", "engops"},
+		{"tags.org", "example-org"},
 	}
 
 	for _, tc := range cases {
@@ -156,6 +158,79 @@ func TestRunConfigShow_RedactsSensitiveEnvVars(t *testing.T) {
 		}
 		if strings.Contains(out, value) {
 			t.Errorf("output leaked value of %s:\n%s", name, out)
+		}
+	}
+}
+
+// config show points at "unset --overrides-shared", which removes exactly the
+// keys it flagged and leaves the rest of the home configuration alone.
+func TestRunConfigUnset_OverridesShared(t *testing.T) {
+	path := setConfigFile(t)
+	shared := filepath.Join(t.TempDir(), "shared.yaml")
+	if err := os.WriteFile(shared, []byte("store:\n  mode: remote\n  url: \"https://shared.supabase.co\"\n  anon_key: k\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BENCHCTL_SHARED_CONFIG_FILE", shared)
+	if err := os.WriteFile(path, []byte("store:\n  mode: local\n  url: \"https://shared.supabase.co\"\n  refresh_interval: 30s\nusername: alice\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { configUnsetOverridesShared = false })
+
+	show := captureStdout(t, func() {
+		if err := runConfigShow(nil, nil); err != nil {
+			t.Fatalf("runConfigShow: %v", err)
+		}
+	})
+	if !strings.Contains(show, "benchctl config unset --overrides-shared") {
+		t.Errorf("config show does not suggest --overrides-shared:\n%s", show)
+	}
+
+	configUnsetOverridesShared = true
+	out := captureStdout(t, func() {
+		if err := runConfigUnset(nil, nil); err != nil {
+			t.Fatalf("runConfigUnset: %v", err)
+		}
+	})
+	if out != "Unset store.mode.\nUnset store.url.\n" {
+		t.Errorf("output = %q", out)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys := cfg.KeysOverridingShared(); len(keys) != 0 {
+		t.Errorf("still overriding: %v", keys)
+	}
+	if cfg.Username != "alice" || cfg.Source("store.refresh_interval") != config.SourceHome {
+		t.Errorf("keys without a shared value were touched: username=%q refresh_interval from %v", cfg.Username, cfg.Source("store.refresh_interval"))
+	}
+
+	out = captureStdout(t, func() {
+		if err := runConfigUnset(nil, nil); err != nil {
+			t.Fatalf("runConfigUnset again: %v", err)
+		}
+	})
+	if !strings.Contains(out, "No keys") {
+		t.Errorf("second run output = %q", out)
+	}
+}
+
+// unset takes either one key or --overrides-shared, never both or neither.
+func TestConfigUnset_Args(t *testing.T) {
+	t.Cleanup(func() { configUnsetOverridesShared = false })
+	for _, tc := range []struct {
+		flag    bool
+		args    []string
+		wantErr bool
+	}{
+		{false, []string{"store.mode"}, false},
+		{false, nil, true},
+		{true, nil, false},
+		{true, []string{"store.mode"}, true},
+	} {
+		configUnsetOverridesShared = tc.flag
+		if err := configUnsetCmd.Args(configUnsetCmd, tc.args); (err != nil) != tc.wantErr {
+			t.Errorf("flag=%v args=%v: err = %v, wantErr %v", tc.flag, tc.args, err, tc.wantErr)
 		}
 	}
 }

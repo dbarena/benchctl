@@ -9,28 +9,29 @@ Both modes support every command, including `--async` runs on an EC2 or GCE driv
 `store.mode` selects the store implementation. benchctl resolves it in this order:
 
 1. `BENCHCTL_STORE_MODE` environment variable
-2. `store.mode` in `~/.benchctl/config.yaml`
-3. Default: `local`
+2. `store.mode` in the home configuration (`~/.benchctl/config.yaml`)
+3. `store.mode` in the shared configuration, if your benchctl was distributed with one
+4. Default configuration: `local`
 
-Every benchctl setting resolves this way. An environment variable set to an
-empty string counts as unset, so resolution falls through to the config file.
+Every benchctl setting resolves this way; see [Configuration](../README.md#configuration).
+An empty value counts as unset, so resolution falls through to the next layer.
 
 `local` keeps state in a SQLite database at `~/.benchctl/state.db` and needs no authentication.
 
-`remote` uses a Supabase (PostgREST) store and requires `store.url` and `store.anon_key`. Both follow the same precedence: `BENCHCTL_STORE_URL` environment variable, then `store.url` in the config file; `BENCHCTL_STORE_ANON_KEY` environment variable, then `store.anon_key` in the config file.
+`remote` uses a Supabase (PostgREST) store and requires `store.url` and `store.anon_key`. Both resolve through the same layers.
 
 | `store.mode` | Store | Location | Auth | Visible to |
 |---|---|---|---|---|
 | `local` (default) | SQLite | `~/.benchctl/state.db` | None | This machine |
 | `remote` | Supabase (PostgREST) | `runs` table at `store.url` | `store.anon_key` (config or `BENCHCTL_STORE_ANON_KEY`) | Everyone with access to the project |
 
-Set `store.mode` with `benchctl config set store.mode remote`, and set `store.url` and `store.anon_key` the same way. View resolved settings with `benchctl config show`.
+If your benchctl was distributed with a shared configuration, it may already set these (check with `benchctl config show`). Otherwise set `store.mode` with `benchctl config set store.mode remote`, and set `store.url` and `store.anon_key` the same way. A key set in the home configuration overrides the shared configuration.
 
 ## Async runs in local mode
 
 An `--async` run executes on the driver instance, not on the machine that
 started it, so the local record would go stale the moment benchctl hands off.
-Rather than require a shared database, local mode reads the run back from the
+Rather than require a remote database, local mode reads the run back from the
 driver instance on demand:
 
 1. `benchctl run --async` copies the run record to the driver instance and

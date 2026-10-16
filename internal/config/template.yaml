@@ -1,0 +1,36 @@
+# benchctl home configuration: your own settings. They override the shared
+# configuration (common settings distributed alongside benchctl, if your
+# install has one) and the default configuration. Environment variables
+# (BENCHCTL_*) override them in turn.
+#
+#   benchctl config show                effective settings and their sources
+#   benchctl config set <key> <value>   set a key in this file
+#   benchctl config unset <key>         remove it again
+#
+# Keys, by the dotted names config set takes. In this file they nest, e.g.
+# store.mode is written as:
+#
+#   store:
+#     mode: remote
+#
+#   store.mode              Where run state is recorded. "local" (default)
+#                           keeps it in ~/.benchctl/state.db. "remote"
+#                           records it in a team-wide Supabase project so
+#                           everyone sees active runs, and requires
+#                           store.url and store.anon_key.
+#   store.url               Supabase project URL for "remote".
+#   store.anon_key          Supabase anon key for "remote".
+#   store.refresh_interval  In "local" mode, how long state read back from a
+#                           remote driver instance over SSH stays fresh
+#                           (default 30s).
+#   metrics.endpoint        VictoriaMetrics base URL for the
+#                           "victoriametrics" collector.
+#   metrics.username        Basic Auth username for metrics.endpoint.
+#   username                Recorded as the owner of each run.
+#   tags.<name>             Applied to every provisioned cloud resource, in
+#                           addition to the tags benchctl always sets itself.
+#
+# Credentials come from the environment only: BENCHCTL_STORE_SERVICE_ROLE_KEY,
+# BENCHCTL_STORE_AUTH_TOKEN, BENCHCTL_METRICS_TOKEN, BENCHCTL_METRICS_PASSWORD
+# and BENCHCTL_SUPABASE_ACCESS_TOKEN. Interactive users run
+# `benchctl auth login` instead of setting a store credential.
