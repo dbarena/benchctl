@@ -12,7 +12,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Do not restore the mise cache in a job that publishes a release. Release jobs can
+      # read caches written on main, so a cache poisoned by any workflow that can write
+      # there would end up in the published binaries.
       - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+        with:
+          cache: false
 
       - name: Build binaries
         run: mise run build-all
