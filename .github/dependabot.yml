@@ -7,13 +7,20 @@ updates:
     open-pull-requests-limit: 5
 
   - package-ecosystem: "github-actions"
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: "weekly"
 
-  - package-ecosystem: "terraform"
+  - package-ecosystem: "opentofu"
     directories:
       - "/deployments/**/*"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+
+  - package-ecosystem: "docker-compose"
+    directory: "/deployments/local"
+    schedule:
+      interval: "monthly"
