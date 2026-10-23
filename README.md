@@ -50,6 +50,25 @@ Caveats:
 - **Source the script, do not execute it.** `source scripts/use.sh` or `. scripts/use.sh`.
 - The shim affects only your *current* shell session. Put the `source` line in your shell's rc file to keep it across sessions.
 
+## Configuration
+
+benchctl resolves each setting from four layers in the order specified below:
+
+| # | Layer | Where | Set by |
+|---|---|---|---|
+| 1 | **Environment variables** | `BENCHCTL_*`, e.g. `BENCHCTL_STORE_MODE` | your shell, CI, remote drivers |
+| 2 | **User configuration** | `~/.benchctl/config.yaml` | you, with `benchctl config set` / `unset` |
+| 3 | **Shared configuration** | `<prefix>/share/benchctl/config.yaml` | whoever distributes benchctl to you, if anyone |
+| 4 | **Default configuration** | built into benchctl | benchctl |
+
+Why a shared configuration as well as a user one? The shared configuration lets whoever distributes benchctl to a group of users give them all the same settings, such as a common remote state store and metrics endpoint, by shipping a file alongside the benchctl binary, for example in a package. Users don't copy anything into their own files, so a changed value in the shared configuration reaches everyone in the next update. The user configuration holds what each person chooses for themselves, and overrides the shared configuration key by key. If you do not use a shared configuration, then you can just rely on the user and default configurations.
+
+- Credentials (tokens, passwords, the service-role key) come only from environment variables, never put them in a shared configuration.
+- `BENCHCTL_CONFIG_FILE` sets the path benchctl reads the user configuration from, instead of `~/.benchctl/config.yaml`.
+- benchctl finds the shared configuration at `../share/benchctl/config.yaml` relative to its binary, after resolving symlinks, so a package that installs `bin/benchctl` can install the file next to it. This path can be overridden with `BENCHCTL_SHARED_CONFIG_FILE`.
+
+`benchctl config show` prints every effective setting and the layer it comes from. It also lists the keys where your user configuration overrides the shared configuration, and the keys where an environment variable overrides a configuration file. You can use `benchctl config unset <key>` to remove a user configuration value, or `benchctl config use-shared` to remove the user configuration values that override the shared configuration. Neither touches environment variables, which keep taking precedence until you unset them.
+
 ## Quick start
 
 Run scenarios locally with Docker Compose for smoke tests and tool validation.
@@ -180,7 +199,7 @@ Monitor, connect, and tear down exactly as in the EC2 workflow above (`benchctl 
 | `benchctl validate <scenario>` | Validate a scenario file without running it |
 | `benchctl info <scenario> [--set key=value]` | Show a scenario's inputs, fixtures, and benchmark steps; `--set` previews the effect of overrides |
 | `benchctl results <run-id>` | Render a per-transaction summary table |
-| `benchctl auth login` | Authenticate to shared Supabase state store with GitHub SSO (optional) |
+| `benchctl auth login` | Authenticate to the remote Supabase state store with GitHub SSO (optional) |
 | `benchctl auth status` | Verify auth and state store access |
 | `benchctl providers list` | List available providers and adapters |
 | `benchctl purge <run-id>` | Delete a run from the state store |
