@@ -115,19 +115,19 @@ run = "go install go.k6.io/k6@latest"
 [tasks.observability-up]
 description = "Start local VictoriaMetrics + Grafana stack (VM :8428, Grafana :3000 admin/admin)"
 run = """
-docker compose -f deployments/local/observability.yml up -d
+docker compose -f deployments/local/compose.yml up -d
 echo "Connect to Grafana at http://localhost:3000/login (user: admin, password: admin)"
 """
 
 [tasks.observability-up-metrics]
 description = "Start only VictoriaMetrics (no Grafana) - used by CI, which never opens the UI"
-run = "docker compose -f deployments/local/observability.yml up -d victoriametrics"
+run = "docker compose -f deployments/local/compose.yml up -d victoriametrics"
 
 [tasks.observability-down]
 description = "Stop local VictoriaMetrics + Grafana stack (preserves data volume)"
-run = "docker compose -f deployments/local/observability.yml down"
+run = "docker compose -f deployments/local/compose.yml down"
 
 [tasks.observability-reset]
 description = "Stop local VictoriaMetrics + Grafana stack and delete all stored metrics (down -v)"
-run = "docker compose -f deployments/local/observability.yml down -v"
+run = "docker compose -f deployments/local/compose.yml down -v"
 
