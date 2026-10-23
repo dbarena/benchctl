@@ -21,7 +21,7 @@ jobs:
       # Do not restore the mise cache in a job that publishes a release. Release jobs can
       # read caches written on main, so a cache poisoned by any workflow that can write
       # there would end up in the published binaries.
-      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+      - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
           cache: false
 
