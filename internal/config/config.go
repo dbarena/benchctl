@@ -1,59 +1,49 @@
-// Package config manages the benchctl user configuration file ~/.benchctl/config.yaml.
+// Package config resolves benchctl settings. Each setting resolves on its own
+// from four layers, and the first that has a value wins:
+//
+//  1. Environment variables: BENCHCTL_*, e.g. BENCHCTL_STORE_MODE. Secrets
+//     come only from here.
+//  2. User configuration: ~/.benchctl/config.yaml (see Path), the user's own
+//     settings, written by Set and Unset.
+//  3. Shared configuration: <prefix>/share/benchctl/config.yaml next to the
+//     binary (see SharedConfigPath), read-only. It lets whoever distributes
+//     benchctl to a group of users give them common settings, such as a
+//     remote state store: they ship the file alongside the binary, and a
+//     change reaches everyone with their next update.
+//  4. Default configuration: defaults.yaml, compiled into the binary.
 package config
 
 import (
 	"bytes"
+	_ "embed"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// defaultConfigTemplate is written verbatim to a new config file. It is a
-// hand-authored string (not encoder output) so it can carry explanatory
-// comments, and it always contains the "store", "metrics" and "tags"
-// sections so that Set only ever needs to append into an existing mapping.
-const defaultConfigTemplate = `# benchctl configuration. Manage with ` + "`benchctl config show`" + ` and
-# ` + "`benchctl config set <key> <value>`" + `.
+// defaultConfigTemplate is written verbatim to a new user configuration file.
+// It is a hand-authored file (not encoder output) so it can carry explanatory
+// comments. It consists of comments only and sets no keys: anything in the
+// user configuration overrides the shared and default configuration, so a new
+// file must not hide them. Set adds keys below the comments as the user sets
+// them.
+//
+//go:embed template.yaml
+var defaultConfigTemplate string
 
-store:
-  # Where run state is recorded. "local" keeps it in ~/.benchctl/state.db.
-  # "remote" records it in a shared Supabase project so the whole team sees
-  # active runs, and requires url and anon_key below.
-  mode: local
-  url: ""
-  anon_key: ""
-  # In "local" mode, how long state read back from a remote driver instance
-  # over SSH stays fresh before the next read refreshes it. Lower it for tighter
-  # ` + "`benchctl wait`" + ` resolution, raise it on a slow link.
-  refresh_interval: 30s
-  # Credentials come from the environment only:
-  #   BENCHCTL_STORE_SERVICE_ROLE_KEY  service-role key, for CI
-  #   BENCHCTL_STORE_AUTH_TOKEN        bearer token, set on remote drivers
-  # Interactive users run ` + "`benchctl auth login`" + ` instead.
-
-metrics:
-  # VictoriaMetrics base URL for the "victoriametrics" collector.
-  endpoint: ""
-  username: ""
-  # Credentials come from the environment only:
-  #   BENCHCTL_METRICS_TOKEN     bearer token
-  #   BENCHCTL_METRICS_PASSWORD  password for the username above
-
-# Recorded as the owner of each run.
-username: ""
-
-# Applied to every provisioned cloud resource, in addition to the tags
-# benchctl always sets itself.
-tags: {}
-
-# The supabase target provider reads its management API token from the
-# environment only: BENCHCTL_SUPABASE_ACCESS_TOKEN
-`
+// defaultConfig is the default configuration: the lowest-priority layer, used
+// when no other layer sets a key.
+//
+//go:embed defaults.yaml
+var defaultConfig []byte
 
 // Mode selects where benchctl records run state.
 type Mode string
@@ -98,8 +88,8 @@ type SupabaseConfig struct {
 	AccessToken string `yaml:"-"`
 }
 
-// Config is the parsed contents of ~/.benchctl/config.yaml, overlaid with
-// any BENCHCTL_* environment variables that are set.
+// Config holds the effective settings, resolved from all four layers (see the
+// package doc).
 type Config struct {
 	Store    StoreConfig       `yaml:"store"`
 	Metrics  MetricsConfig     `yaml:"metrics"`
@@ -107,10 +97,21 @@ type Config struct {
 	Tags     map[string]string `yaml:"tags"`
 	Supabase SupabaseConfig    `yaml:"-"`
 
-	// sources records, per dotted key, whether the effective value came from
-	// the environment or the config file. Populated by Load.
+	// sources records, per dotted key, which layer the effective value came
+	// from. Populated by Load.
 	sources map[string]Source
+	// userOverridesShared records the dotted keys that both the user and the
+	// shared configuration set, so the user value overrides the shared one.
+	// Populated by Load.
+	userOverridesShared map[string]bool
+	// envOverrides records the dotted keys whose environment variable wins
+	// over a value in the user or shared configuration, in envTable order.
+	// Populated by Load.
+	envOverrides []string
 }
+
+// tagKeyPrefix precedes a tag name to form its dotted key, e.g. "tags.team".
+const tagKeyPrefix = "tags."
 
 // envEntry describes one BENCHCTL_* environment variable: the dotted config
 // key it overlays, whether it holds a secret, and how to read/write it on a
@@ -208,13 +209,36 @@ var envTable = []envEntry{
 	},
 }
 
-// Path returns the location of the config file.
+// FileKeys lists the settings that can be written to the user configuration
+// file, in the order "benchctl config show" lists them. Secrets are left out,
+// as they come only from the environment
+func FileKeys() []string {
+	var keys []string
+	for _, e := range envTable {
+		if !e.secret {
+			keys = append(keys, e.key)
+		}
+	}
+	return keys
+}
+
+// Environment variables that locate the configuration files. They are not
+// settings, so they live outside envTable.
+const (
+	envConfigFile       = "BENCHCTL_CONFIG_FILE"
+	envSharedConfigFile = "BENCHCTL_SHARED_CONFIG_FILE"
+)
+
+// pathEnvVars lists the variables above in the order EnvStates reports them.
+var pathEnvVars = []string{envConfigFile, envSharedConfigFile}
+
+// Path returns the location of the user configuration file.
 //
 // BENCHCTL_CONFIG_FILE overrides the default location when set to a
 // non-empty value. An empty value has no special meaning: unset and
 // empty-string BENCHCTL_CONFIG_FILE both fall back to the default path.
 func Path() (string, error) {
-	if p := os.Getenv("BENCHCTL_CONFIG_FILE"); p != "" {
+	if p := os.Getenv(envConfigFile); p != "" {
 		return p, nil
 	}
 	home, err := os.UserHomeDir()
@@ -224,15 +248,46 @@ func Path() (string, error) {
 	return filepath.Join(home, ".benchctl", "config.yaml"), nil
 }
 
-// Load reads and parses the config file, creating it from the default
-// template if it does not yet exist, then overlays any set BENCHCTL_*
-// environment variables on top. The returned Config always has a non-nil
-// Tags map and a valid Store.Mode.
+// SharedConfigPath returns the location of the shared configuration file, or
+// "" when there is none.
+//
+// BENCHCTL_SHARED_CONFIG_FILE names it explicitly; set but empty disables the
+// shared configuration. Otherwise benchctl looks for share/benchctl/config.yaml
+// next to its own binary (after resolving symlinks).
+func SharedConfigPath() string {
+	if p, ok := os.LookupEnv(envSharedConfigFile); ok {
+		return p
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return sharedConfigBesideExecutable(exe)
+}
+
+// sharedConfigBesideExecutable returns <prefix>/share/benchctl/config.yaml for an
+// executable at <prefix>/bin/benchctl, or "" if that file does not exist.
+func sharedConfigBesideExecutable(exe string) string {
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	p := filepath.Join(filepath.Dir(exe), "..", "share", "benchctl", "config.yaml")
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
+}
+
+// Load resolves every setting from the four layers described in the package
+// doc. It creates the user configuration file from the template if it does
+// not yet exist. An empty value counts as unset in every layer. The returned
+// Config always has a non-nil Tags map and a valid Store.Mode.
 func Load() (*Config, error) {
 	path, err := Path()
 	if err != nil {
 		return nil, err
 	}
+	sharedPath := SharedConfigPath()
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -248,39 +303,125 @@ func Load() (*Config, error) {
 		data = []byte(defaultConfigTemplate)
 	}
 
-	var cfg Config
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)
-	if err := dec.Decode(&cfg); err != nil && err != io.EOF {
-		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	var userCfg Config
+	if err := parseConfig(data, path, &userCfg); err != nil {
+		return nil, err
 	}
 
-	cfg.sources = make(map[string]Source, len(envTable))
-	for _, e := range envTable {
-		envVal := os.Getenv(e.env)
-		switch {
-		case envVal != "":
-			e.set(&cfg, envVal)
-			cfg.sources[e.key] = SourceEnv
-		case e.get(&cfg) != "":
-			cfg.sources[e.key] = SourceFile
-		default:
-			cfg.sources[e.key] = SourceUnset
+	var defCfg Config
+	if err := parseConfig(defaultConfig, "default configuration", &defCfg); err != nil {
+		return nil, err
+	}
+
+	var sharedCfg Config
+	if sharedPath != "" {
+		sdata, err := os.ReadFile(sharedPath)
+		if err != nil {
+			return nil, fmt.Errorf("config: read shared configuration %s: %w", sharedPath, err)
+		}
+		if err := parseConfig(sdata, sharedPath, &sharedCfg); err != nil {
+			return nil, err
 		}
 	}
 
-	if cfg.Store.Mode == "" {
-		cfg.Store.Mode = ModeLocal
-	}
-	if cfg.Store.Mode != ModeLocal && cfg.Store.Mode != ModeRemote {
-		return nil, fmt.Errorf("config: store.mode %q is invalid (valid values: %q, %q)", cfg.Store.Mode, ModeLocal, ModeRemote)
+	// effectiveCfg starts as the user configuration and
+	// takes each key from the highest layer that sets it.
+	effectiveCfg := userCfg
+	effectiveCfg.sources = make(map[string]Source, len(envTable))
+	effectiveCfg.userOverridesShared = make(map[string]bool)
+	for _, e := range envTable {
+		envVal := os.Getenv(e.env)
+		// Flag it even if the values are equal or the environment wins: the
+		// user value still overrides the shared one in the files.
+		effectiveCfg.userOverridesShared[e.key] = e.get(&userCfg) != "" && e.get(&sharedCfg) != ""
+		switch {
+		case envVal != "":
+			if e.get(&userCfg) != "" || e.get(&sharedCfg) != "" {
+				effectiveCfg.envOverrides = append(effectiveCfg.envOverrides, e.key)
+			}
+			e.set(&effectiveCfg, envVal)
+			effectiveCfg.sources[e.key] = SourceEnv
+		case e.get(&userCfg) != "":
+			effectiveCfg.sources[e.key] = SourceUser
+		case e.get(&sharedCfg) != "":
+			e.set(&effectiveCfg, e.get(&sharedCfg))
+			effectiveCfg.sources[e.key] = SourceShared
+		case e.get(&defCfg) != "":
+			e.set(&effectiveCfg, e.get(&defCfg))
+			effectiveCfg.sources[e.key] = SourceDefault
+		default:
+			effectiveCfg.sources[e.key] = SourceUnset
+		}
 	}
 
-	if cfg.Tags == nil {
-		cfg.Tags = map[string]string{}
+	// An empty tag counts as unset, so drop it
+	effectiveCfg.Tags = maps.Clone(userCfg.Tags)
+	for name, value := range effectiveCfg.Tags {
+		key := tagKeyPrefix + name
+		if value == "" {
+			delete(effectiveCfg.Tags, name)
+			continue
+		}
+		// Non-empty user configuration tags win over shared.
+		effectiveCfg.sources[key] = SourceUser
+		effectiveCfg.userOverridesShared[key] = sharedCfg.Tags[name] != ""
+	}
+	for name, value := range sharedCfg.Tags {
+		key := tagKeyPrefix + name
+		if value == "" || effectiveCfg.Tags[name] != "" {
+			continue
+		}
+		if effectiveCfg.Tags == nil {
+			effectiveCfg.Tags = map[string]string{}
+		}
+		effectiveCfg.Tags[name] = value
+		effectiveCfg.sources[key] = SourceShared
 	}
 
-	return &cfg, nil
+	if effectiveCfg.Store.Mode != ModeLocal && effectiveCfg.Store.Mode != ModeRemote {
+		return nil, fmt.Errorf("config: store.mode %q is invalid (valid values: %q, %q)", effectiveCfg.Store.Mode, ModeLocal, ModeRemote)
+	}
+
+	if effectiveCfg.Tags == nil {
+		effectiveCfg.Tags = map[string]string{}
+	}
+
+	return &effectiveCfg, nil
+}
+
+// parseConfig decodes a config document into cfg, rejecting unknown keys.
+func parseConfig(data []byte, path string, cfg *Config) error {
+	if err := rejectDottedKeys(data, path); err != nil {
+		return err
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil && err != io.EOF {
+		return fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	return nil
+}
+
+// rejectDottedKeys reports a top-level key written in the dotted form that
+// "benchctl config set" takes, such as "store.mode: local". YAML reads that as
+// one unknown key named "store.mode"; the error says how to write it instead.
+// Documents that do not parse are left for the decoder to report.
+func rejectDottedKeys(data []byte, path string) error {
+	var root yaml.Node
+	if yaml.Unmarshal(data, &root) != nil || len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return nil
+	}
+	doc := root.Content[0]
+	for i := 0; i+1 < len(doc.Content); i += 2 {
+		k := doc.Content[i]
+		section, field, err := setTarget(k.Value)
+		if err != nil || section == "" {
+			continue
+		}
+		return fmt.Errorf("config: parse %s: line %d: write %q as nested YAML (%q, then %q indented below it), or run 'benchctl config set %s <value>'",
+			path, k.Line, k.Value, section+":", field+": "+doc.Content[i+1].Value, k.Value)
+	}
+	return nil
 }
 
 // Validate checks invariants that Load does not enforce, so that read-only
@@ -338,8 +479,8 @@ func (c *Config) RemoteEnv() map[string]string {
 	return env
 }
 
-// Source reports whether the effective value at dottedKey (e.g. "store.url")
-// came from the environment, the config file, or neither.
+// Source reports which layer the effective value at dottedKey (e.g.
+// "store.url") came from, or SourceUnset if none has a value.
 func (c *Config) Source(dottedKey string) Source {
 	if c.sources == nil {
 		return SourceUnset
@@ -347,22 +488,85 @@ func (c *Config) Source(dottedKey string) Source {
 	return c.sources[dottedKey]
 }
 
-// Source identifies where a configuration value's effective value came from.
+// Value returns the effective value of dottedKey (e.g. "store.url" or
+// "tags.team"), or "" if it is unset.
+func (c *Config) Value(dottedKey string) string {
+	if name, ok := strings.CutPrefix(dottedKey, tagKeyPrefix); ok {
+		return c.Tags[name]
+	}
+	for _, e := range envTable {
+		if e.key == dottedKey {
+			return e.get(c)
+		}
+	}
+	return ""
+}
+
+// EnvOverrideKeys returns every dotted key whose environment variable
+// overrides a value set in the user or shared configuration, in the order
+// "benchctl config show" lists them.
+func (c *Config) EnvOverrideKeys() []string {
+	return c.envOverrides
+}
+
+// EnvVar returns the name of the environment variable that overlays dottedKey,
+// or "" if there is none (tags have no variable).
+func EnvVar(dottedKey string) string {
+	for _, e := range envTable {
+		if e.key == dottedKey {
+			return e.env
+		}
+	}
+	return ""
+}
+
+// UserOverridesShared reports whether the user configuration sets dottedKey
+// although the shared configuration has a value for it too.
+func (c *Config) UserOverridesShared(dottedKey string) bool {
+	return c.userOverridesShared[dottedKey]
+}
+
+// UserOverrideKeys returns every dotted key for which UserOverridesShared is
+// true, in the order "benchctl config show" lists them.
+func (c *Config) UserOverrideKeys() []string {
+	var keys []string
+	for _, e := range envTable {
+		if c.userOverridesShared[e.key] {
+			keys = append(keys, e.key)
+		}
+	}
+	var tagKeys []string
+	for name := range c.Tags {
+		if c.userOverridesShared[tagKeyPrefix+name] {
+			tagKeys = append(tagKeys, tagKeyPrefix+name)
+		}
+	}
+	sort.Strings(tagKeys)
+	return append(keys, tagKeys...)
+}
+
+// Source identifies the layer a setting's effective value came from.
 type Source int
 
 const (
-	SourceUnset Source = iota
-	SourceFile
-	SourceEnv
+	SourceUnset   Source = iota
+	SourceUser           // user configuration
+	SourceEnv            // environment variable
+	SourceShared         // shared configuration
+	SourceDefault        // default configuration
 )
 
 // String returns a human-readable label for s.
 func (s Source) String() string {
 	switch s {
-	case SourceFile:
-		return "config file"
+	case SourceUser:
+		return "user configuration"
 	case SourceEnv:
 		return "env"
+	case SourceShared:
+		return "shared configuration"
+	case SourceDefault:
+		return "default configuration"
 	default:
 		return "unset"
 	}
@@ -378,17 +582,20 @@ type EnvState struct {
 }
 
 // EnvStates reports the current state of every benchctl environment
-// variable, in display order, led by BENCHCTL_CONFIG_FILE. Set is true when
+// variable, in display order, led by BENCHCTL_CONFIG_FILE and
+// BENCHCTL_SHARED_CONFIG_FILE. Set is true when
 // a variable is present in the environment even if its value is empty, so
 // callers can distinguish "unset" from "set but empty". Value is always ""
 // for secrets.
 func EnvStates() []EnvState {
-	states := make([]EnvState, 0, len(envTable)+1)
+	states := make([]EnvState, 0, len(pathEnvVars)+len(envTable))
 
-	if v, ok := os.LookupEnv("BENCHCTL_CONFIG_FILE"); ok {
-		states = append(states, EnvState{Name: "BENCHCTL_CONFIG_FILE", Value: v, Set: true})
-	} else {
-		states = append(states, EnvState{Name: "BENCHCTL_CONFIG_FILE"})
+	for _, name := range pathEnvVars {
+		if v, ok := os.LookupEnv(name); ok {
+			states = append(states, EnvState{Name: name, Value: v, Set: true})
+		} else {
+			states = append(states, EnvState{Name: name})
+		}
 	}
 
 	for _, e := range envTable {
@@ -402,42 +609,21 @@ func EnvStates() []EnvState {
 	return states
 }
 
-// Set writes a single dotted key to the config file, preserving all existing
-// comments. Accepted keys are "store.mode", "store.url", "store.anon_key",
-// "store.refresh_interval", "metrics.endpoint", "metrics.username",
-// "username", and "tags.<name>".
+// Set writes a single dotted key to the user configuration file, preserving all existing
+// comments. Accepted keys are FileKeys and "tags.<name>".
 // Secret keys are rejected with the environment variable to set instead. Set
-// is the only writer of the config file: there is no bulk-save path, since
-// re-marshalling the Config struct would discard the comments this function
-// is careful to keep.
+// and Unset are the only writers of the user configuration file: there is no bulk-save
+// path, since re-marshalling the Config struct would discard the comments
+// they are careful to keep.
 func Set(key, value string) error {
-	if _, err := Load(); err != nil {
-		return err
-	}
-
-	path, err := Path()
+	path, root, err := readDocument()
 	if err != nil {
 		return err
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("config: read %s: %w", path, err)
-	}
-
-	var root yaml.Node
-	if err := yaml.Unmarshal(data, &root); err != nil {
-		return fmt.Errorf("config: parse %s: %w", path, err)
-	}
-	if len(root.Content) == 0 {
-		return fmt.Errorf("config: %s: empty document", path)
 	}
 	doc := root.Content[0]
 
-	for _, e := range envTable {
-		if e.secret && e.key == key {
-			return fmt.Errorf("config: %s is set via the %s environment variable, not the config file", key, e.env)
-		}
+	if err := rejectSecret(key); err != nil {
+		return err
 	}
 
 	if key == "store.mode" && value != string(ModeLocal) && value != string(ModeRemote) {
@@ -455,19 +641,126 @@ func Set(key, value string) error {
 		}
 	}
 	setScalar(mapping, field, value)
+	return writeDocument(path, root)
+}
 
+// Unset removes a single dotted key from the user configuration file,
+// preserving all other content and comments, so the key falls back to the
+// shared configuration, if any, or the default configuration. It reports
+// whether the key was present. Accepted keys are the same as for Set.
+func Unset(key string) (bool, error) {
+	path, root, err := readDocument()
+	if err != nil {
+		return false, err
+	}
+	doc := root.Content[0]
+
+	if err := rejectSecret(key); err != nil {
+		return false, err
+	}
+	section, field, err := setTarget(key)
+	if err != nil {
+		return false, err
+	}
+	mapping := doc
+	if section != "" {
+		// readDocument has already rejected a malformed section via Load, so
+		// the only error left here is a missing section: nothing to remove.
+		if mapping, err = mappingValue(doc, section, false); err != nil {
+			return false, nil
+		}
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value != field {
+			continue
+		}
+		mapping.Content = append(mapping.Content[:i], mapping.Content[i+2:]...)
+		if section != "" && len(mapping.Content) == 0 {
+			removeKey(doc, section)
+		}
+		return true, writeDocument(path, root)
+	}
+	return false, nil
+}
+
+// removeKey deletes key and its value from the mapping node m, if present.
+func removeKey(m *yaml.Node, key string) {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content = append(m.Content[:i], m.Content[i+2:]...)
+			return
+		}
+	}
+}
+
+// readDocument loads the user configuration file (creating it from the
+// template if missing) as a YAML node tree, so callers can edit it without
+// losing comments. The root's single child is always the top-level mapping.
+func readDocument() (string, *yaml.Node, error) {
+	if _, err := Load(); err != nil {
+		return "", nil, err
+	}
+	path, err := Path()
+	if err != nil {
+		return "", nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", nil, fmt.Errorf("config: read %s: %w", path, err)
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return "", nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	if len(root.Content) == 0 {
+		// A file of only comments, such as the template, parses to nothing and
+		// its comments are dropped. Keep them as the document's head comment.
+		root = yaml.Node{
+			Kind:        yaml.DocumentNode,
+			HeadComment: strings.TrimSpace(string(data)),
+			Content:     []*yaml.Node{{Kind: yaml.MappingNode}},
+		}
+	}
+	if root.Content[0].Kind != yaml.MappingNode {
+		return "", nil, fmt.Errorf("config: %s: top level must be a mapping of settings", path)
+	}
+	return path, &root, nil
+}
+
+// writeDocument encodes root back to the user configuration file at path. A document
+// without any keys is written as its comments alone rather than as "{}".
+func writeDocument(path string, root *yaml.Node) error {
+	if len(root.Content[0].Content) == 0 {
+		var data []byte
+		if root.HeadComment != "" {
+			data = []byte(root.HeadComment + "\n")
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			return fmt.Errorf("config: write %s: %w", path, err)
+		}
+		return nil
+	}
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
-	if err := enc.Encode(&root); err != nil {
+	if err := enc.Encode(root); err != nil {
 		return fmt.Errorf("config: encode %s: %w", path, err)
 	}
 	if err := enc.Close(); err != nil {
 		return fmt.Errorf("config: encode %s: %w", path, err)
 	}
-
 	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
 		return fmt.Errorf("config: write %s: %w", path, err)
+	}
+	return nil
+}
+
+// rejectSecret returns an error for keys that only come from the environment.
+func rejectSecret(key string) error {
+	for _, e := range envTable {
+		if e.secret && e.key == key {
+			return fmt.Errorf("config: %s is set via the %s environment variable, not the config file", key, e.env)
+		}
 	}
 	return nil
 }
@@ -477,32 +770,43 @@ func Set(key, value string) error {
 // that section. It returns an error for unknown keys, mirroring the keys
 // documented on Set.
 func setTarget(key string) (section, field string, err error) {
-	switch {
-	case key == "store.mode" || key == "store.url" || key == "store.anon_key" || key == "store.refresh_interval":
-		return "store", strings.TrimPrefix(key, "store."), nil
-	case key == "metrics.endpoint" || key == "metrics.username":
-		return "metrics", strings.TrimPrefix(key, "metrics."), nil
-	case key == "username":
-		return "", "username", nil
-	case strings.HasPrefix(key, "tags."):
-		name := strings.TrimPrefix(key, "tags.")
+	if name, ok := strings.CutPrefix(key, tagKeyPrefix); ok {
 		if name == "" {
 			return "", "", fmt.Errorf("config: invalid key %q: tag name must not be empty", key)
 		}
 		return "tags", name, nil
-	default:
-		return "", "", fmt.Errorf("config: unknown key %q; valid keys are store.mode, store.url, store.anon_key, store.refresh_interval, metrics.endpoint, metrics.username, username, and tags.<name>", key)
 	}
+	if !slices.Contains(FileKeys(), key) {
+		return "", "", fmt.Errorf("config: unknown key %q; valid keys are %s, and tags.<name>", key, strings.Join(FileKeys(), ", "))
+	}
+	// A dotted key is "<section>.<field>".
+	// TODO: Deeper keys need Set, Unset and mappingValue to walk a path instead of a section.
+	section, field, _ = strings.Cut(key, ".")
+	if field == "" {
+		return "", section, nil
+	}
+	return section, field, nil
 }
 
 // mappingValue returns the mapping node for the given top-level key within
 // doc (a mapping node). If create is true and the key is absent, an empty
-// mapping is appended and returned.
+// mapping is appended and returned. A key with no value ("metrics:" followed
+// only by comments parses as null) is turned into an empty mapping in place;
+// otherwise entries appended to it would be silently dropped on encode.
 func mappingValue(doc *yaml.Node, key string, create bool) (*yaml.Node, error) {
 	for i := 0; i+1 < len(doc.Content); i += 2 {
-		if doc.Content[i].Value == key {
-			return doc.Content[i+1], nil
+		if doc.Content[i].Value != key {
+			continue
 		}
+		v := doc.Content[i+1]
+		switch {
+		case v.Kind == yaml.MappingNode:
+		case v.Kind == yaml.ScalarNode && v.Tag == "!!null":
+			v.Kind, v.Tag, v.Value, v.Style = yaml.MappingNode, "", "", 0
+		default:
+			return nil, fmt.Errorf("config: %q must be a mapping of settings", key)
+		}
+		return v, nil
 	}
 	if !create {
 		return nil, fmt.Errorf("config: missing %q section", key)
