@@ -815,16 +815,25 @@ func (p *Provider) ensureBenchctlBinary(binPath string) error {
 // remoteBenchctlBin. Mirrors the go-tpc install pattern already used in
 // cloud-init user_data (see deployments/ec2/loaddriver_gotpc/main.tf).
 func (p *Provider) fetchReleaseBinary(ctx context.Context, keyPath, target, arch string) error {
-	binURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/benchctl-linux-%s", buildinfo.Repo, buildinfo.Version, arch)
-	checksumsURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/checksums.txt", buildinfo.Repo, buildinfo.Version)
-	cmd := fmt.Sprintf(`set -euo pipefail
-curl -fsSL --retry 5 --retry-delay 10 -o /tmp/benchctl %s
-curl -fsSL --retry 5 --retry-delay 10 -o /tmp/checksums.txt %s
-(cd /tmp && grep ' benchctl-linux-%s$' checksums.txt | sha256sum -c -)
-chmod +x /tmp/benchctl
-mv /tmp/benchctl %s`,
-		shellQuote(binURL), shellQuote(checksumsURL), arch, remoteBenchctlBin)
-	return p.ssh(ctx, keyPath, target, cmd)
+	return p.ssh(ctx, keyPath, target, fetchReleaseBinaryCmd(arch, remoteBenchctlBin))
+}
+
+// fetchReleaseBinaryCmd returns the remote shell script for fetchReleaseBinary.
+// The binary must be saved under its release asset name because sha256sum -c
+// looks up the file names listed in checksums.txt.
+func fetchReleaseBinaryCmd(arch, dest string) string {
+	asset := "benchctl-linux-" + arch
+	baseURL := fmt.Sprintf("https://github.com/%s/releases/download/%s", buildinfo.Repo, buildinfo.Version)
+	return fmt.Sprintf(`set -euo pipefail
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cd "$tmp"
+curl -fsSL --retry 5 --retry-delay 10 -o %[1]s %[2]s
+curl -fsSL --retry 5 --retry-delay 10 -o checksums.txt %[3]s
+grep ' %[1]s$' checksums.txt | sha256sum -c -
+chmod +x %[1]s
+mv %[1]s %[4]s`,
+		asset, shellQuote(baseURL+"/"+asset), shellQuote(baseURL+"/checksums.txt"), dest)
 }
 
 // shellQuote wraps s in single quotes, escaping any single quotes within.
