@@ -45,6 +45,9 @@ const (
 	// _supabase_profile stores the CLI profile used at provision time so
 	// teardown can use the same profile on a fresh CI runner.
 	outputKeyProfile = "_supabase_profile"
+	// The diagnostics collector reads these two, to size post-run collection.
+	outputKeyDiagnosticsMaxProjects = "_supabase_diagnostics_max_projects"
+	outputKeyDiagnosticsParallel    = "_supabase_diagnostics_parallel"
 	// _supabase_run_id stores the run ID so teardown can remove the local
 	// working directory on success.
 	outputKeyRunID = "_supabase_run_id"
@@ -260,7 +263,11 @@ type providerConfig struct {
 	ThrottleSkipToken string
 	RequireHostSuffix string
 	MaxFailedProjects int
-	ReadyTimeout      time.Duration
+	// DiagnosticsMaxProjects and DiagnosticsParallel tune post-run collection
+	// (benchctl fetch); zero means the collector's default.
+	DiagnosticsMaxProjects int
+	DiagnosticsParallel    int
+	ReadyTimeout           time.Duration
 
 	DiskSizeGB          int
 	DiskIOPS            int
@@ -307,6 +314,12 @@ func parseConfig(cfg map[string]any) (providerConfig, error) {
 		return c, err
 	}
 	if c.MaxParallelProjects, err = parsePositiveIntConfig(cfg, "max_parallel_projects", defaultMaxParallelProjects); err != nil {
+		return c, err
+	}
+	if c.DiagnosticsMaxProjects, err = parsePositiveIntConfig(cfg, "diagnostics_max_projects", 0); err != nil {
+		return c, err
+	}
+	if c.DiagnosticsParallel, err = parsePositiveIntConfig(cfg, "diagnostics_parallel", 0); err != nil {
 		return c, err
 	}
 	if c.DiskSizeGB, err = parseIntConfig(cfg, "disk_size_gb"); err != nil {
@@ -376,6 +389,10 @@ func parsePositiveIntConfig(cfg map[string]any, key string, def int) (int, error
 //	project_count    int      number of projects to create (optional, default 1)
 //	max_parallel_projects int how many projects to create at once (optional,
 //	                          default 10)
+//	diagnostics_max_projects int how many projects `benchctl fetch` collects from
+//	                          a Management API run (optional, default 5)
+//	diagnostics_parallel int  how many projects it collects at once (optional,
+//	                          default 5)
 //	project_size     string   instance size, e.g. "micro" (optional; when unset
 //	                          --size is omitted and the API picks the
 //	                          organisation's default size)
@@ -561,12 +578,23 @@ func refOutputs(c providerConfig, runID string, projects []project) engine.Outpu
 	for i, pr := range projects {
 		refs[i] = pr.ref
 	}
-	return engine.Outputs{
+	return diagnosticsOutputs(c, engine.Outputs{
 		outputKeyProjectRefs:  strings.Join(refs, ","),
 		outputKeyProfile:      c.Profile,
 		outputKeyRunID:        runID,
 		outputKeyProjectCount: strconv.Itoa(c.ProjectCount),
+	})
+}
+
+// diagnosticsOutputs adds the diagnostics settings the scenario set to out.
+func diagnosticsOutputs(c providerConfig, out engine.Outputs) engine.Outputs {
+	if c.DiagnosticsMaxProjects > 0 {
+		out[outputKeyDiagnosticsMaxProjects] = strconv.Itoa(c.DiagnosticsMaxProjects)
 	}
+	if c.DiagnosticsParallel > 0 {
+		out[outputKeyDiagnosticsParallel] = strconv.Itoa(c.DiagnosticsParallel)
+	}
+	return out
 }
 
 // TeardownSeed implements engine.TeardownSeeder. Before any project exists,

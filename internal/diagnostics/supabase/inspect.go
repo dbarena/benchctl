@@ -27,6 +27,13 @@ const outputManagementAPIURL = "_supabase_management_api_url"
 // several projects, which lists none of them in its outputs.
 const outputProjectsManifest = "projects_manifest"
 
+// outputDiagnosticsMaxProjects and outputDiagnosticsParallel carry the
+// scenario's collection settings, when it set them.
+const (
+	outputDiagnosticsMaxProjects = "_supabase_diagnostics_max_projects"
+	outputDiagnosticsParallel    = "_supabase_diagnostics_parallel"
+)
+
 // inspectDirName holds the CSVs `supabase inspect report` writes.
 const inspectDirName = "inspect"
 

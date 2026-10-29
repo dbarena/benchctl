@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -378,19 +379,38 @@ func TestPreflight_SamplesTheManifest(t *testing.T) {
 	if err := os.WriteFile(path, []byte(lines.String()), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	c := New(&config.Config{Supabase: config.SupabaseConfig{AccessToken: "sbp_test"}})
-	c.checkCLI = noopCheckCLI
-	if err := c.Preflight(diagnostics.Request{Outputs: map[string]string{"projects_manifest": path}}); err != nil {
-		t.Fatalf("Preflight: %v", err)
-	}
+
 	// ref1 never got ready, so it has no host to collect from.
-	var got []string
-	for _, p := range c.projects {
-		got = append(got, p.Ref+" "+p.DBHost)
+	tests := []struct {
+		name         string
+		settings     map[string]string
+		want         []string
+		wantParallel int
+	}{
+		{"defaults", nil, []string{"ref0", "ref2", "ref3", "ref4", "ref5"}, 5},
+		{"scenario settings", map[string]string{outputDiagnosticsMaxProjects: "2", outputDiagnosticsParallel: "3"}, []string{"ref0", "ref2"}, 3},
+		{"invalid settings fall back", map[string]string{outputDiagnosticsMaxProjects: "x", outputDiagnosticsParallel: "0"}, []string{"ref0", "ref2", "ref3", "ref4", "ref5"}, 5},
 	}
-	want := []string{"ref0 db.ref0.supabase.red", "ref2 db.ref2.supabase.red", "ref3 db.ref3.supabase.red", "ref4 db.ref4.supabase.red", "ref5 db.ref5.supabase.red"}
-	if !slices.Equal(got, want) {
-		t.Errorf("projects = %v, want %v", got, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := New(&config.Config{Supabase: config.SupabaseConfig{AccessToken: "sbp_test"}})
+			c.checkCLI = noopCheckCLI
+			outputs := map[string]string{"projects_manifest": path}
+			maps.Copy(outputs, tt.settings)
+			if err := c.Preflight(diagnostics.Request{Outputs: outputs}); err != nil {
+				t.Fatalf("Preflight: %v", err)
+			}
+			var got []string
+			for _, p := range c.projects {
+				got = append(got, p.Ref)
+				if p.DBHost != "db."+p.Ref+".supabase.red" {
+					t.Errorf("%s host = %q", p.Ref, p.DBHost)
+				}
+			}
+			if !slices.Equal(got, tt.want) || c.parallel != tt.wantParallel {
+				t.Errorf("projects = %v, parallel = %d; want %v, %d", got, c.parallel, tt.want, tt.wantParallel)
+			}
+		})
 	}
 }
 
