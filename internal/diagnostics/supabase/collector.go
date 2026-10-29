@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/dbarena/benchctl/internal/config"
@@ -14,16 +15,16 @@ import (
 	supabaseprovider "github.com/dbarena/benchctl/internal/providers/supabase"
 )
 
-// maxParallelProjects caps how many projects of a multi-project run are
+// defaultParallelProjects is how many projects of a multi-project run are
 // collected at once. Each one is a handful of Management API calls plus a
 // `supabase inspect report`, which opens its own database connection.
-const maxParallelProjects = 5
+const defaultParallelProjects = 5
 
-// maxSampledProjects caps how many projects of a Management API run with
+// defaultSampledProjects is how many projects of a Management API run with
 // several projects are collected: the first ones to become ready stand for
 // the rest, which can number tens of thousands. A CLI run lists every project
 // in its outputs, and all of them are collected.
-const maxSampledProjects = 5
+const defaultSampledProjects = 5
 
 // Collector implements diagnostics.Collector for Supabase targets.
 type Collector struct {
@@ -42,6 +43,7 @@ type Collector struct {
 
 	// Resolved once in Preflight.
 	projects []supabaseprovider.TargetProject
+	parallel int
 	token    string
 	profile  string
 	apiURL   string
@@ -72,9 +74,10 @@ func (c *Collector) Preflight(req diagnostics.Request) error {
 		return fmt.Errorf("target declares vendor %q but exports no project_ref, project_refs or ready projects in projects_manifest", diagnostics.VendorSupabase)
 	}
 	if req.Outputs[outputProjectsManifest] != "" {
-		projects = projects[:min(len(projects), maxSampledProjects)]
+		projects = projects[:min(len(projects), positiveOutput(req.Outputs, outputDiagnosticsMaxProjects, defaultSampledProjects))]
 	}
 	c.projects = projects
+	c.parallel = positiveOutput(req.Outputs, outputDiagnosticsParallel, defaultParallelProjects)
 	c.profile = req.Outputs[outputProfile]
 	c.apiURL = req.Outputs[outputManagementAPIURL]
 
@@ -87,6 +90,15 @@ func (c *Collector) Preflight(req diagnostics.Request) error {
 		return errors.New("no Supabase access token; set BENCHCTL_SUPABASE_ACCESS_TOKEN or SUPABASE_ACCESS_TOKEN")
 	}
 	return nil
+}
+
+// positiveOutput reads a positive integer from the run's outputs, or returns
+// def when it is missing or invalid.
+func positiveOutput(outputs map[string]string, key string, def int) int {
+	if n, err := strconv.Atoi(outputs[key]); err == nil && n > 0 {
+		return n
+	}
+	return def
 }
 
 // Collect gathers everything reachable for every sampled project and reports
@@ -108,7 +120,11 @@ func (c *Collector) Collect(ctx context.Context, req diagnostics.Request) (diagn
 	// Each project fills its own Result, merged afterwards in creation order,
 	// so the index doesn't depend on which project finished first.
 	results := make([]diagnostics.Result, len(c.projects))
-	supabaseprovider.ForEachParallel(len(c.projects), maxParallelProjects, func(i int) {
+	parallel := c.parallel
+	if parallel < 1 {
+		parallel = defaultParallelProjects
+	}
+	supabaseprovider.ForEachParallel(len(c.projects), parallel, func(i int) {
 		p := c.projects[i]
 		reportf := func(format string, args ...any) {
 			req.Reportf("project %d/%d %s: "+format, append([]any{i + 1, len(c.projects), p.Ref}, args...)...)

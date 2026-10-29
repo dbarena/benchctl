@@ -264,14 +264,14 @@ func mgmtRefOutputs(c providerConfig, runID string, projects []project) engine.O
 	}
 	if c.ProjectCount > 1 {
 		out[outputKeyProjectsManifest] = filepath.Join(workDirForRun(runID), manifestFile)
-		return out
+		return diagnosticsOutputs(c, out)
 	}
 	refs := make([]string, len(projects))
 	for i, pr := range projects {
 		refs[i] = pr.ref
 	}
 	out[outputKeyProjectRefs] = strings.Join(refs, ",")
-	return out
+	return diagnosticsOutputs(c, out)
 }
 
 // progress counts a run's projects through each stage. It prints a summary

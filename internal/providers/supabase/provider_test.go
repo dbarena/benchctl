@@ -991,6 +991,35 @@ func TestParseConfig_ParallelismDefaults(t *testing.T) {
 	}
 }
 
+func TestParseConfig_DiagnosticsSettings(t *testing.T) {
+	cfg := testProvisionConfig()
+	cfg["diagnostics_max_projects"] = "20"
+	cfg["diagnostics_parallel"] = "8"
+	c, err := parseConfig(cfg)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	for name, out := range map[string]engine.Outputs{
+		"CLI":      refOutputs(c, "run", nil),
+		"mgmt API": mgmtRefOutputs(c, "run", nil),
+	} {
+		if out[outputKeyDiagnosticsMaxProjects] != "20" || out[outputKeyDiagnosticsParallel] != "8" {
+			t.Errorf("%s outputs = %v, want the diagnostics settings", name, out)
+		}
+	}
+
+	// Unset means the collector's defaults: no output at all.
+	c, _ = parseConfig(testProvisionConfig())
+	if out := refOutputs(c, "run", nil); out[outputKeyDiagnosticsMaxProjects] != "" || out[outputKeyDiagnosticsParallel] != "" {
+		t.Errorf("unset settings still produced outputs: %v", out)
+	}
+
+	cfg["diagnostics_parallel"] = "-1"
+	if _, err := parseConfig(cfg); err == nil {
+		t.Error("parseConfig accepted diagnostics_parallel = -1")
+	}
+}
+
 func TestRunCaptureErr_RetriesRateLimitedCalls(t *testing.T) {
 	throttled := fakeCmdResponse{
 		stderr: `Failed to delete project a: {"message":"ThrottlerException: Too Many Requests"}`,
