@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/dbarena/benchctl/internal/engine"
@@ -34,6 +35,19 @@ func TestBuildCmd(t *testing.T) {
 				"run", "--summary-export", "summary.json", "--new-machine-readable-summary",
 				"--env", "BASE_URI=https://example.com",
 				"--env", "SERVICE_TOKEN=tok123",
+				"test.js",
+			},
+		},
+		{
+			name: "large outputs skipped, targets file passed",
+			outputs: engine.Outputs{
+				"project_refs":              strings.Repeat("r", maxEnvValue+1),
+				engine.OutputKeyTargetsFile: "/home/ubuntu/benchctl/targets.json",
+			},
+			step: schema.SuiteStep{Command: "test.js"},
+			wantArgs: []string{
+				"run", "--summary-export", "summary.json", "--new-machine-readable-summary",
+				"--env", "BENCHCTL_TARGETS_FILE=/home/ubuntu/benchctl/targets.json",
 				"test.js",
 			},
 		},

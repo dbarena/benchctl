@@ -77,11 +77,17 @@ func (a *Adapter) VersionInfo(ctx context.Context) map[string]string {
 	}
 }
 
+// maxEnvValue is the largest output passed as --env. Larger ones (e.g. a ref
+// list at thousands of projects) would hit Linux's 128 KiB per-argument limit;
+// scripts read those from BENCHCTL_TARGETS_FILE instead.
+const maxEnvValue = 4 << 10
+
 // buildCmd constructs the k6 invocation.
 //
 // step.Command is the script file path.
 // step.Args are passed as --vus, --duration, --iterations, etc.
-// Target outputs are forwarded to the k6 script as --env KEY=VALUE.
+// Target outputs up to maxEnvValue are forwarded to the k6 script as
+// --env KEY=VALUE, and a shipped targets file as BENCHCTL_TARGETS_FILE.
 func buildCmd(outputs engine.Outputs, step schema.SuiteStep) []string {
 	args := []string{"run", "--summary-export", "summary.json", "--new-machine-readable-summary"}
 
@@ -92,6 +98,9 @@ func buildCmd(outputs engine.Outputs, step schema.SuiteStep) []string {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
+		if len(outputs[k]) > maxEnvValue {
+			continue
+		}
 		args = append(args, "--env", k+"="+outputs[k])
 	}
 
