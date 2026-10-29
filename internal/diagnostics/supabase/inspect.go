@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,14 @@ import (
 // outputProfile carries the CLI profile provisioning used, so collection
 // talks to the same environment.
 const outputProfile = "_supabase_profile"
+
+// outputManagementAPIURL carries the Management API provisioning used, when it
+// went through the Management API rather than the CLI.
+const outputManagementAPIURL = "_supabase_management_api_url"
+
+// outputProjectsManifest names the manifest of a Management API run with
+// several projects, which lists none of them in its outputs.
+const outputProjectsManifest = "projects_manifest"
 
 // inspectDirName holds the CSVs `supabase inspect report` writes.
 const inspectDirName = "inspect"
@@ -59,12 +68,25 @@ func (c *Collector) collectInspectReport(ctx context.Context, req diagnostics.Re
 	dir := filepath.Join(projectDir, inspectDirName)
 	name := artifactName(req, projectDir, inspectDirName)
 	args := []string{"inspect", "report", "--project-ref", p.Ref, "--output-dir", dir}
-	if c.profile != "" {
-		args = append(args, "--profile", c.profile)
-	}
 	command := "supabase " + strings.Join(args, " ")
+	profile, custom, cleanup, err := c.inspectProfile(p)
+	if err != nil {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", name, err))
+		return
+	}
+	defer cleanup()
+	if profile != "" {
+		args = append(args, "--profile", profile)
+		if custom {
+			// The generated file is gone once the report ends, so the
+			// recorded command names the API it stands for instead.
+			command += " --profile <profile for " + c.apiURL + ">"
+		} else {
+			command += " --profile " + profile
+		}
+	}
 
-	_, err := c.run(ctx, c.env(), args...)
+	_, err = c.run(ctx, c.env(), args...)
 	if err != nil && ctx.Err() == nil {
 		_, err = c.run(ctx, c.env(), args...)
 	}
@@ -119,4 +141,46 @@ func (c *Collector) env() []string {
 		env = append(env, "SUPABASE_ACCESS_TOKEN="+c.token)
 	}
 	return env
+}
+
+// inspectProfile returns the --profile value for the CLI to use for project p.
+//
+// The CLI picks its Management API from the profile. A run that overrode the
+// API with management_api_url is not reachable through any named profile, so
+// the CLI would ask production instead. For such a run this writes a profile
+// file that points at the run's API, and returns its path with custom set. The
+// caller must call cleanup once the CLI has run.
+func (c *Collector) inspectProfile(p supabaseprovider.TargetProject) (profile string, custom bool, cleanup func(), err error) {
+	noop := func() {}
+	if c.apiURL == "" {
+		return c.profile, false, noop, nil
+	}
+	// Compare with the API the CLI itself will use for the profile. It does
+	// not guess from the project's host the way ManagementAPIBase does.
+	if base, ok := supabaseprovider.ProfileAPIBase(c.profile); ok && base == c.apiURL {
+		return c.profile, false, noop, nil
+	}
+	u, err := url.Parse(c.apiURL)
+	if err != nil || u.Hostname() == "" {
+		return "", false, noop, fmt.Errorf("management API URL %q is not usable as a CLI profile", c.apiURL)
+	}
+	// project_host is the domain project hosts live under: db.<ref>.<domain>.
+	host := strings.TrimPrefix(p.DBHost, "db."+p.Ref+".")
+	if host == "" || host == p.DBHost {
+		host = u.Hostname()
+	}
+	f, err := os.CreateTemp("", "benchctl-supabase-profile-*.yaml")
+	if err != nil {
+		return "", false, noop, fmt.Errorf("write CLI profile: %w", err)
+	}
+	cleanup = func() { os.Remove(f.Name()) }
+	_, err = fmt.Fprintf(f, "name: benchctl-custom\napi_url: %q\ndashboard_url: %q\nproject_host: %q\n", c.apiURL, c.apiURL, host)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		cleanup()
+		return "", false, noop, fmt.Errorf("write CLI profile: %w", err)
+	}
+	return f.Name(), true, cleanup, nil
 }

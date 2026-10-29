@@ -3,6 +3,7 @@ package supabase
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -76,6 +77,7 @@ type fakeCLI struct {
 	failFor   string // a --project-ref to fail with err; empty fails every call
 	failTimes int    // fail only this many calls; zero fails them all
 	writeTo   func(dir string)
+	onRun     func(args []string) // sees each call's argv while the files it names still exist
 }
 
 func (f *fakeCLI) run(_ context.Context, _ []string, args ...string) ([]byte, error) {
@@ -83,6 +85,9 @@ func (f *fakeCLI) run(_ context.Context, _ []string, args ...string) ([]byte, er
 	f.calls = append(f.calls, args)
 	n := len(f.calls)
 	f.mu.Unlock()
+	if f.onRun != nil {
+		f.onRun(args)
+	}
 	if f.err != nil && (f.failFor == "" || slices.Contains(args, f.failFor)) && (f.failTimes == 0 || n <= f.failTimes) {
 		return nil, f.err
 	}
@@ -360,6 +365,35 @@ func TestPreflight_ResolvesEveryProject(t *testing.T) {
 	}
 }
 
+func TestPreflight_SamplesTheManifest(t *testing.T) {
+	var lines strings.Builder
+	for i := range 7 {
+		ref := fmt.Sprintf("ref%d", i)
+		fmt.Fprintf(&lines, `{"e":"created","name":"n%d","ref":%q}`+"\n", i, ref)
+		if i != 1 {
+			fmt.Fprintf(&lines, `{"e":"ready","ref":%q,"api_url":"https://%s.supabase.red","key":"k"}`+"\n", ref, ref)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "projects.jsonl")
+	if err := os.WriteFile(path, []byte(lines.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := New(&config.Config{Supabase: config.SupabaseConfig{AccessToken: "sbp_test"}})
+	c.checkCLI = noopCheckCLI
+	if err := c.Preflight(diagnostics.Request{Outputs: map[string]string{"projects_manifest": path}}); err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	// ref1 never got ready, so it has no host to collect from.
+	var got []string
+	for _, p := range c.projects {
+		got = append(got, p.Ref+" "+p.DBHost)
+	}
+	want := []string{"ref0 db.ref0.supabase.red", "ref2 db.ref2.supabase.red", "ref3 db.ref3.supabase.red", "ref4 db.ref4.supabase.red", "ref5 db.ref5.supabase.red"}
+	if !slices.Equal(got, want) {
+		t.Errorf("projects = %v, want %v", got, want)
+	}
+}
+
 func TestInspectReport_RetriesOnce(t *testing.T) {
 	f := newFakeAPI(t, okHandler)
 	cli := &fakeCLI{err: errors.New("Failed to create login role"), failTimes: 1, writeTo: writeReportCSVs(t, "calls.csv")}
@@ -435,13 +469,15 @@ func TestPreflight(t *testing.T) {
 // being queried against production, which would return 404s that look like a
 // missing project rather than a wrong host.
 func TestAPIBase_DerivesTheEnvironment(t *testing.T) {
-	tests := []struct{ profile, dbHost, want string }{
-		{"", "db.abc.supabase.co", "https://api.supabase.com/v1/projects/abc"},
-		{"", "db.abc.supabase.red", "https://api.supabase.green/v1/projects/abc"},
-		{"supabase-local", "db.abc.supabase.red", "http://localhost:8080/v1/projects/abc"},
+	tests := []struct{ profile, apiURL, dbHost, want string }{
+		{"", "", "db.abc.supabase.co", "https://api.supabase.com/v1/projects/abc"},
+		{"", "", "db.abc.supabase.red", "https://api.supabase.green/v1/projects/abc"},
+		{"supabase-local", "", "db.abc.supabase.red", "http://localhost:8080/v1/projects/abc"},
+		// The API provisioning recorded wins.
+		{"supabase-local", "https://mgmt.example", "db.abc.supabase.red", "https://mgmt.example/v1/projects/abc"},
 	}
 	for _, tt := range tests {
-		c := &Collector{profile: tt.profile}
+		c := &Collector{profile: tt.profile, apiURL: tt.apiURL}
 		if got := c.apiBase(supabaseprovider.TargetProject{Ref: "abc", DBHost: tt.dbHost}); got != tt.want {
 			t.Errorf("apiBase for %s with profile %q = %q, want %q", tt.dbHost, tt.profile, got, tt.want)
 		}
@@ -475,13 +511,67 @@ func TestInspectReport_UsesTheProjectRefNotThePassword(t *testing.T) {
 	}
 }
 
-func TestAPIErrorMessage(t *testing.T) {
-	if got := apiErrorMessage([]byte(`{"message":"Project not found"}`), "404 Not Found"); got != "Project not found" {
-		t.Errorf("got %q", got)
-	}
-	if got := apiErrorMessage([]byte(`nope`), "500 Internal Server Error"); got != "500 Internal Server Error" {
-		t.Errorf("got %q, want the status fallback", got)
-	}
+func TestInspectReport_UsesTheRunsAPIForACustomURL(t *testing.T) {
+	f := newFakeAPI(t, okHandler)
+	req := testRequest(t)
+
+	t.Run("a URL the profile does not know gets a generated profile", func(t *testing.T) {
+		var profileText string
+		cli := &fakeCLI{writeTo: writeReportCSVs(t, "calls.csv")}
+		cli.onRun = func(args []string) {
+			if i := slices.Index(args, "--profile"); i >= 0 {
+				b, err := os.ReadFile(args[i+1])
+				if err != nil {
+					t.Errorf("profile file: %v", err)
+				}
+				profileText = string(b)
+			}
+		}
+		c := f.collector(cli)
+		c.apiURL = "http://localhost:8080"
+		var res diagnostics.Result
+		c.collectInspectReport(context.Background(), req, testProject, req.Dest, &res)
+
+		for _, want := range []string{`api_url: "http://localhost:8080"`, `project_host: "supabase.co"`} {
+			if !strings.Contains(profileText, want) {
+				t.Errorf("profile = %q, want it to contain %s", profileText, want)
+			}
+		}
+		for _, a := range res.Artifacts {
+			if strings.Contains(a.Command, "benchctl-supabase-profile") {
+				t.Errorf("recorded command names the temporary profile: %s", a.Command)
+			}
+		}
+		if i := slices.Index(cli.calls[0], "--profile"); i < 0 {
+			t.Fatalf("argv = %v, want --profile", cli.calls[0])
+		} else if _, err := os.Stat(cli.calls[0][i+1]); !os.IsNotExist(err) {
+			t.Errorf("generated profile %s was not removed", cli.calls[0][i+1])
+		}
+	})
+
+	t.Run("a staging URL with no profile is not mistaken for the default", func(t *testing.T) {
+		cli := &fakeCLI{writeTo: writeReportCSVs(t, "calls.csv")}
+		c := f.collector(cli)
+		c.profile, c.apiURL = "", "https://api.supabase.green"
+		staging := supabaseprovider.TargetProject{Ref: "abcdefghijklmnop", DBHost: "db.abcdefghijklmnop.supabase.red"}
+		var res diagnostics.Result
+		c.collectInspectReport(context.Background(), req, staging, req.Dest, &res)
+		// With no --profile the CLI would use production.
+		if !slices.Contains(cli.calls[0], "--profile") {
+			t.Errorf("argv = %v, want a generated --profile for the staging API", cli.calls[0])
+		}
+	})
+
+	t.Run("the profile's own API keeps its name", func(t *testing.T) {
+		cli := &fakeCLI{writeTo: writeReportCSVs(t, "calls.csv")}
+		c := f.collector(cli)
+		c.profile, c.apiURL = "supabase-staging", "https://api.supabase.green"
+		var res diagnostics.Result
+		c.collectInspectReport(context.Background(), req, testProject, req.Dest, &res)
+		if argv := strings.Join(cli.calls[0], " "); !strings.Contains(argv, "--profile supabase-staging") {
+			t.Errorf("argv = %q, want the named profile", argv)
+		}
+	})
 }
 
 // noopCheckCLI bypasses the PATH lookup so these tests exercise the

@@ -173,7 +173,7 @@ func TestManagementAPIBase(t *testing.T) {
 
 func TestTargetProjects(t *testing.T) {
 	t.Run("several projects", func(t *testing.T) {
-		got := TargetProjects(engine.Outputs{
+		got, _ := TargetProjects(engine.Outputs{
 			outputKeyProjectRefs:          "a,b",
 			outputKeyAPIURL + "a":         "https://a.supabase.red",
 			outputKeyAPIURL + "b":         "https://b.supabase.red",
@@ -186,14 +186,14 @@ func TestTargetProjects(t *testing.T) {
 	})
 
 	t.Run("single project from before api_url", func(t *testing.T) {
-		got := TargetProjects(engine.Outputs{outputKeyProjectRef: "a", "host": "db.a.supabase.co"})
+		got, _ := TargetProjects(engine.Outputs{outputKeyProjectRef: "a", "host": "db.a.supabase.co"})
 		if want := []TargetProject{{Ref: "a", DBHost: "db.a.supabase.co"}}; !slices.Equal(got, want) {
 			t.Errorf("TargetProjects() = %v, want %v", got, want)
 		}
 	})
 
 	t.Run("no projects", func(t *testing.T) {
-		if got := TargetProjects(engine.Outputs{}); len(got) != 0 {
+		if got, _ := TargetProjects(engine.Outputs{}); len(got) != 0 {
 			t.Errorf("TargetProjects() = %v, want none", got)
 		}
 	})
