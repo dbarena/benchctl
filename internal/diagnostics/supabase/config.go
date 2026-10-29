@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/dbarena/benchctl/internal/diagnostics"
+	supabaseprovider "github.com/dbarena/benchctl/internal/providers/supabase"
 )
 
 // configSnapshots contains the Management API calls to capture relevant
@@ -44,14 +45,14 @@ var configSnapshots = []struct {
 	{file: "addons.json", path: "/billing/addons", keep: "selected_addons", why: "compute size"},
 }
 
-// collectConfig snapshots the project's configuration.
-func (c *Collector) collectConfig(ctx context.Context, req diagnostics.Request, res *diagnostics.Result) {
+// collectConfig snapshots project p's configuration into dir.
+func (c *Collector) collectConfig(ctx context.Context, req diagnostics.Request, p supabaseprovider.TargetProject, dir string, res *diagnostics.Result) {
 	for _, s := range configSnapshots {
-		body, requestURL, err := c.get(ctx, s.path, nil)
+		body, requestURL, err := c.get(ctx, p, s.path, nil)
 		if err == nil && s.keep != "" {
 			body, err = keepField(body, s.keep)
 		}
-		req.Save(res, req.Dest, s.file, "GET "+requestURL, body, err)
+		req.Save(res, dir, s.file, "GET "+requestURL, body, err)
 	}
 }
 
