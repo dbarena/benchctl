@@ -354,6 +354,11 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// Fall back to the token the supabase CLI reads.
+	if effectiveCfg.Supabase.AccessToken == "" {
+		effectiveCfg.Supabase.AccessToken = os.Getenv("SUPABASE_ACCESS_TOKEN")
+	}
+
 	// An empty tag counts as unset, so drop it
 	effectiveCfg.Tags = maps.Clone(userCfg.Tags)
 	for name, value := range effectiveCfg.Tags {

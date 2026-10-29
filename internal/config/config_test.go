@@ -153,6 +153,22 @@ tags: {}
 	}
 }
 
+func TestLoad_SupabaseCLITokenFallback(t *testing.T) {
+	setConfigFile(t)
+	t.Setenv("SUPABASE_ACCESS_TOKEN", "from-cli-env")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Supabase.AccessToken != "from-cli-env" {
+		t.Errorf("AccessToken = %q, want the CLI's token", cfg.Supabase.AccessToken)
+	}
+	t.Setenv("BENCHCTL_SUPABASE_ACCESS_TOKEN", "own")
+	if cfg, err = Load(); err != nil || cfg.Supabase.AccessToken != "own" {
+		t.Errorf("AccessToken = %q (%v), want benchctl's own to win", cfg.Supabase.AccessToken, err)
+	}
+}
+
 func TestLoad_EmptyEnvVarTreatedAsUnset(t *testing.T) {
 	setConfigFile(t)
 	fixture := `store:
