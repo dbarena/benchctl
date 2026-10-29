@@ -282,6 +282,16 @@ func (r *Runner) Run(ctx context.Context, s *schema.Scenario, inputs schema.Reso
 		}
 		targetOutputs = Outputs(mapped)
 	}
+	// Workloads run here, so they read a target's TargetsFile where the target
+	// wrote it.
+	if tf, ok := r.Target.(TargetFiles); ok {
+		for local, remote := range tf.TargetFiles(rawTargetOutputs) {
+			if remote == TargetsFile {
+				targetOutputs = maps.Clone(targetOutputs)
+				targetOutputs[OutputKeyTargetsFile] = local
+			}
+		}
+	}
 	teardowns = append(teardowns, func(ctx context.Context) error {
 		r.logf("Tearing down target [%s]", s.Target.Provider)
 		return r.Target.Teardown(ctx, targetOutputs)
@@ -713,6 +723,9 @@ func (r *Runner) RunAsync(ctx context.Context, s *schema.Scenario, inputs schema
 		RunID:         runID,
 		ScenarioPath:  r.ScenarioPath,
 	}
+	if tf, ok := r.Target.(TargetFiles); ok {
+		req.Files = tf.TargetFiles(rawTargetOutputs)
+	}
 	// A store the driver instance cannot read has to be seeded with the record,
 	// or `benchctl resume` there has nothing to load. Seeding last means the
 	// seed carries every output written above, including the driver-side
@@ -768,6 +781,16 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 	runID := state.RunID
 	inputs := rehydrateInputs(state.Inputs, s.Inputs)
 	targetOutputs := Outputs(state.TargetOutputs)
+	// Bootstrap ships a target's TargetsFile next to the scenario; tell the
+	// workload adapters where it is on this machine.
+	if p, err := filepath.Abs(filepath.Join(filepath.Dir(r.ScenarioPath), TargetsFile)); err == nil && r.ScenarioPath != "" {
+		if _, err := os.Stat(p); err == nil {
+			if targetOutputs == nil {
+				targetOutputs = Outputs{}
+			}
+			targetOutputs[OutputKeyTargetsFile] = p
+		}
+	}
 	tc := &TemplateContext{Inputs: inputs, TargetOutputs: targetOutputs}
 	tc.ProviderOutputs = targetOutputs
 	toolVersions := collectToolVersionLabels(ctx, r.Workloads)

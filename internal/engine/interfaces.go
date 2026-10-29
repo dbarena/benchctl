@@ -181,6 +181,26 @@ type BootstrapRequest struct {
 	// store the driver reads the same record the orchestrator wrote, and this
 	// is empty.
 	StateSeed []byte
+	// Files maps a local path to a path relative to the driver's benchctl
+	// directory (where the scenario lands). Filled from TargetFiles.
+	Files map[string]string
+}
+
+// TargetsFile is the path, relative to the driver's benchctl directory, that a
+// target's list of load targets is shipped to. Resume reports it to workload
+// adapters under OutputKeyTargetsFile when it is there.
+const TargetsFile = "targets.json"
+
+// OutputKeyTargetsFile is the Outputs key that carries the absolute path of a
+// target's TargetsFile where the workload runs. Workload adapters pass outputs
+// on as environment variables, so it is named as one.
+const OutputKeyTargetsFile = "BENCHCTL_TARGETS_FILE"
+
+// TargetFiles is an optional interface a TargetProvider may implement to ship
+// local files to a remote driver. It returns local path to remote path, the
+// remote path relative to the driver's benchctl directory.
+type TargetFiles interface {
+	TargetFiles(outputs Outputs) map[string]string
 }
 
 // AsyncBootstrapper is an optional interface implemented by DriverProviders that

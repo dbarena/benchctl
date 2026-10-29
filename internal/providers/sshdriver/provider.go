@@ -317,6 +317,21 @@ func (p *Provider) Bootstrap(ctx context.Context, req engine.BootstrapRequest) e
 		}
 	}
 
+	// SCP files the target wants on the driver (e.g. its load targets), sorted
+	// so the order is stable.
+	locals := make([]string, 0, len(req.Files))
+	for local := range req.Files {
+		locals = append(locals, local)
+	}
+	sort.Strings(locals)
+	for _, local := range locals {
+		remote := req.Files[local]
+		consolelog.Println(p.out, fmt.Sprintf("%s: bootstrap: SCP %s", p.cfg.ProviderName, remote))
+		if err := p.scp(ctx, keyPath, local, scpHost(target)+":"+remoteDir+"/"+remote); err != nil {
+			return fmt.Errorf("%s: bootstrap: scp %s: %w", p.cfg.ProviderName, remote, err)
+		}
+	}
+
 	// Seed the run record into the driver's own store. Without it `benchctl
 	// resume` there has nothing to load, since a store that is local to the
 	// orchestrator holds the only copy.
