@@ -24,10 +24,12 @@ import (
 )
 
 const (
-	// A run with several projects lists them in a file instead, because every
+	// A run with several projects lists them in files instead, because every
 	// output becomes an argument to the workload: projects_manifest is the
-	// run's manifest (see manifest), and projects_ready how many are ready.
+	// run's manifest (see manifest), targets_file its ready projects as
+	// targets.json, and projects_ready how many are ready.
 	outputKeyProjectsManifest = "projects_manifest"
+	outputKeyTargetsFile      = "targets_file"
 	outputKeyProjectsReady    = "projects_ready"
 
 	// _supabase_management_api is "true" for a run provisioned through the
@@ -71,7 +73,7 @@ func managementAPIURL(apiURL, profile string) (string, error) {
 }
 
 // mgmtOnlyKeys are the config keys only the Management API path reads.
-var mgmtOnlyKeys = []string{"management_api_url", "throttle_skip_token", "max_failed_projects", "ready_timeout", "require_host_suffix"}
+var mgmtOnlyKeys = []string{"management_api_url", "throttle_skip_token", "max_failed_projects", "ready_timeout", "require_host_suffix", "seed_sql"}
 
 // boolConfig reads a bool that arrives as a bool, or as a string after
 // templating.
@@ -117,6 +119,7 @@ func parseManagementAPIConfig(cfg map[string]any, c providerConfig) (providerCon
 			return c, fmt.Errorf("config.ready_timeout %q is invalid: want a positive duration such as 90m", v)
 		}
 	}
+	c.SeedSQL, _ = cfg["seed_sql"].(string)
 	return c, nil
 }
 
@@ -139,6 +142,9 @@ func parseManagementAPIConfig(cfg map[string]any, c providerConfig) (providerCon
 //	                          in this domain, e.g. supabase.red (optional).
 //	                          Guards against the platform placing projects
 //	                          somewhere other than intended.
+//	seed_sql         string   SQL to run once in every project after it is
+//	                          healthy, through the Management API, so a
+//	                          workload has tables to hit (optional)
 //
 // A project that fails is left for teardown, which can delete it once the
 // API allows. The run goes on while no more than max_failed_projects have
@@ -146,7 +152,7 @@ func parseManagementAPIConfig(cfg map[string]any, c providerConfig) (providerCon
 //
 // A single project's outputs include host, port, user, project_ref,
 // project_refs, api_url_<ref> and publishable_key_<ref>. Several projects get
-// projects_manifest and projects_ready instead.
+// projects_manifest, targets_file and projects_ready instead.
 func (p mgmt) provision(ctx context.Context, runID string, cfg map[string]any) (engine.Outputs, error) {
 	c, err := parseConfig(cfg)
 	if err != nil {
@@ -215,8 +221,31 @@ func (p mgmt) provision(ctx context.Context, runID string, cfg map[string]any) (
 		}
 		return mgmtRefOutputs(c, runID, created), fmt.Errorf("supabase: %w", cause)
 	}
+	if c.ProjectCount > 1 {
+		if err := writeTargets(targetsPathForRun(runID), ready); err != nil {
+			return mgmtRefOutputs(c, runID, nil), fmt.Errorf("supabase: %w", err)
+		}
+	}
 
 	return run.outputs(runID, ready), nil
+}
+
+// targetsPathForRun returns where Provision writes a run's targets.json.
+func targetsPathForRun(runID string) string {
+	return filepath.Join(workDirForRun(runID), engine.TargetsFile)
+}
+
+// TargetFiles implements engine.TargetFiles: it ships a run's targets.json to
+// the driver, when the run has one.
+func (p *Provider) TargetFiles(outputs engine.Outputs) map[string]string {
+	path := outputs[outputKeyTargetsFile]
+	if path == "" {
+		return nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	return map[string]string{path: engine.TargetsFile}
 }
 
 // mgmtRun holds what every project in a run shares.
@@ -239,6 +268,7 @@ func (r mgmtRun) outputs(runID string, projects []project) engine.Outputs {
 	out["sslnegotiation"] = "direct"
 	out[outputKeyVendor] = "supabase"
 	if r.cfg.ProjectCount > 1 {
+		out[outputKeyTargetsFile] = targetsPathForRun(runID)
 		out[outputKeyProjectsReady] = strconv.Itoa(len(projects))
 		return out
 	}
@@ -397,6 +427,9 @@ func (p mgmt) provisionProject(ctx context.Context, run mgmtRun, name string) (p
 
 	key, err := p.publishableKey(ctx, run.client, ref)
 	if err != nil {
+		return pr, err
+	}
+	if err := p.seedProject(ctx, run.client, ref, c.SeedSQL); err != nil {
 		return pr, err
 	}
 	if err := p.resizeDisk(ctx, run.client.base+"/v1/projects/"+ref+"/config/disk", c.DiskSizeGB, c.DiskIOPS, c.DiskThroughputMibps, c.DiskType); err != nil {
@@ -787,6 +820,29 @@ func (p mgmt) publishableKey(ctx context.Context, client *mgmtClient, ref string
 		}
 		if err := sleep(ctx, p.pollIntervalOrDefault()); err != nil {
 			return "", err
+		}
+	}
+}
+
+// seedProject runs sql in the project's database. The API can answer 5xx for
+// a moment after the project turns healthy, so those are retried; a 4xx is a
+// bad query and fails at once. It does nothing when sql is empty.
+func (p mgmt) seedProject(ctx context.Context, client *mgmtClient, ref, sql string) error {
+	if sql == "" {
+		return nil
+	}
+	timeout := p.pollTimeoutOrDefault()
+	deadline := time.Now().Add(timeout)
+	for {
+		_, err := client.doThrottled(ctx, http.MethodPost, "/v1/projects/"+ref+"/database/query", map[string]any{"query": sql})
+		if err == nil {
+			return nil
+		}
+		if !transient(ctx, err) || time.Now().After(deadline) {
+			return fmt.Errorf("seed %s: %w", ref, err)
+		}
+		if err := sleep(ctx, p.pollIntervalOrDefault()); err != nil {
+			return err
 		}
 	}
 }

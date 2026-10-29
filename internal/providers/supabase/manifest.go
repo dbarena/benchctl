@@ -130,3 +130,27 @@ func orphanNames(events []manifestEvent) []string {
 	}
 	return names
 }
+
+// target is one entry of targets.json, the list of ready projects a load
+// driver probes.
+type target struct {
+	Ref    string `json:"ref"`
+	APIURL string `json:"api_url"`
+	Key    string `json:"key"`
+}
+
+// writeTargets writes the ready projects to path as a JSON array.
+func writeTargets(path string, projects []project) error {
+	targets := make([]target, len(projects))
+	for i, pr := range projects {
+		targets[i] = target{Ref: pr.ref, APIURL: apiURL(pr.dbHost), Key: pr.publishableKey}
+	}
+	b, err := json.Marshal(targets)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		return fmt.Errorf("write targets: %w", err)
+	}
+	return nil
+}

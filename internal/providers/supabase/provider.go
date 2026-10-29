@@ -262,6 +262,7 @@ type providerConfig struct {
 	DiagnosticsMaxProjects int
 	DiagnosticsParallel    int
 	ReadyTimeout           time.Duration
+	SeedSQL                string
 
 	DiskSizeGB          int
 	DiskIOPS            int
