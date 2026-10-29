@@ -18,6 +18,14 @@ import (
 // talks to the same environment.
 const outputProfile = "_supabase_profile"
 
+// outputManagementAPIURL carries the Management API provisioning used, when it
+// went through the Management API rather than the CLI.
+const outputManagementAPIURL = "_supabase_management_api_url"
+
+// outputProjectsManifest names the manifest of a Management API run with
+// several projects, which lists none of them in its outputs.
+const outputProjectsManifest = "projects_manifest"
+
 // inspectDirName holds the CSVs `supabase inspect report` writes.
 const inspectDirName = "inspect"
 

@@ -19,6 +19,12 @@ import (
 // `supabase inspect report`, which opens its own database connection.
 const maxParallelProjects = 5
 
+// maxSampledProjects caps how many projects of a Management API run with
+// several projects are collected: the first ones to become ready stand for
+// the rest, which can number tens of thousands. A CLI run lists every project
+// in its outputs, and all of them are collected.
+const maxSampledProjects = 5
+
 // Collector implements diagnostics.Collector for Supabase targets.
 type Collector struct {
 	// checkCLI overrides the PATH lookup in Preflight; nil uses the real one.
@@ -38,6 +44,7 @@ type Collector struct {
 	projects []supabaseprovider.TargetProject
 	token    string
 	profile  string
+	apiURL   string
 }
 
 var (
@@ -57,11 +64,19 @@ func (c *Collector) Preflight(req diagnostics.Request) error {
 		return err
 	}
 
-	c.projects = supabaseprovider.TargetProjects(req.Outputs)
-	if len(c.projects) == 0 {
-		return fmt.Errorf("target declares vendor %q but exports no project_ref or project_refs", diagnostics.VendorSupabase)
+	projects, err := supabaseprovider.TargetProjects(req.Outputs)
+	if err != nil {
+		return fmt.Errorf("read the run's projects: %w", err)
 	}
+	if len(projects) == 0 {
+		return fmt.Errorf("target declares vendor %q but exports no project_ref, project_refs or ready projects in projects_manifest", diagnostics.VendorSupabase)
+	}
+	if req.Outputs[outputProjectsManifest] != "" {
+		projects = projects[:min(len(projects), maxSampledProjects)]
+	}
+	c.projects = projects
 	c.profile = req.Outputs[outputProfile]
+	c.apiURL = req.Outputs[outputManagementAPIURL]
 
 	if c.cfg != nil {
 		c.token = c.cfg.Supabase.AccessToken
@@ -69,13 +84,13 @@ func (c *Collector) Preflight(req diagnostics.Request) error {
 	if c.token == "" {
 		// Not `supabase login`: that stores the token in the OS keyring, where
 		// the Management API calls here can't read it.
-		return errors.New("no Supabase access token; set BENCHCTL_SUPABASE_ACCESS_TOKEN")
+		return errors.New("no Supabase access token; set BENCHCTL_SUPABASE_ACCESS_TOKEN or SUPABASE_ACCESS_TOKEN")
 	}
 	return nil
 }
 
-// Collect gathers everything reachable for every project and reports what it
-// could not.
+// Collect gathers everything reachable for every sampled project and reports
+// what it could not.
 //
 // A single project's artifacts go straight into the diagnostics directory, as
 // they always have. With several, each project gets a subdirectory named after

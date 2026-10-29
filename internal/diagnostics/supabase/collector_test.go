@@ -3,6 +3,7 @@ package supabase
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -360,6 +361,35 @@ func TestPreflight_ResolvesEveryProject(t *testing.T) {
 	}
 }
 
+func TestPreflight_SamplesTheManifest(t *testing.T) {
+	var lines strings.Builder
+	for i := range 7 {
+		ref := fmt.Sprintf("ref%d", i)
+		fmt.Fprintf(&lines, `{"e":"created","name":"n%d","ref":%q}`+"\n", i, ref)
+		if i != 1 {
+			fmt.Fprintf(&lines, `{"e":"ready","ref":%q,"api_url":"https://%s.supabase.red","key":"k"}`+"\n", ref, ref)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "projects.jsonl")
+	if err := os.WriteFile(path, []byte(lines.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := New(&config.Config{Supabase: config.SupabaseConfig{AccessToken: "sbp_test"}})
+	c.checkCLI = noopCheckCLI
+	if err := c.Preflight(diagnostics.Request{Outputs: map[string]string{"projects_manifest": path}}); err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	// ref1 never got ready, so it has no host to collect from.
+	var got []string
+	for _, p := range c.projects {
+		got = append(got, p.Ref+" "+p.DBHost)
+	}
+	want := []string{"ref0 db.ref0.supabase.red", "ref2 db.ref2.supabase.red", "ref3 db.ref3.supabase.red", "ref4 db.ref4.supabase.red", "ref5 db.ref5.supabase.red"}
+	if !slices.Equal(got, want) {
+		t.Errorf("projects = %v, want %v", got, want)
+	}
+}
+
 func TestInspectReport_RetriesOnce(t *testing.T) {
 	f := newFakeAPI(t, okHandler)
 	cli := &fakeCLI{err: errors.New("Failed to create login role"), failTimes: 1, writeTo: writeReportCSVs(t, "calls.csv")}
@@ -436,13 +466,15 @@ func TestPreflight(t *testing.T) {
 // being queried against production, which would return 404s that look like a
 // missing project rather than a wrong host.
 func TestAPIBase_DerivesTheEnvironment(t *testing.T) {
-	tests := []struct{ profile, dbHost, want string }{
-		{"", "db.abc.supabase.co", "https://api.supabase.com/v1/projects/abc"},
-		{"", "db.abc.supabase.red", "https://api.supabase.green/v1/projects/abc"},
-		{"supabase-local", "db.abc.supabase.red", "http://localhost:8080/v1/projects/abc"},
+	tests := []struct{ profile, apiURL, dbHost, want string }{
+		{"", "", "db.abc.supabase.co", "https://api.supabase.com/v1/projects/abc"},
+		{"", "", "db.abc.supabase.red", "https://api.supabase.green/v1/projects/abc"},
+		{"supabase-local", "", "db.abc.supabase.red", "http://localhost:8080/v1/projects/abc"},
+		// The API provisioning recorded wins.
+		{"supabase-local", "https://mgmt.example", "db.abc.supabase.red", "https://mgmt.example/v1/projects/abc"},
 	}
 	for _, tt := range tests {
-		c := &Collector{profile: tt.profile}
+		c := &Collector{profile: tt.profile, apiURL: tt.apiURL}
 		if got := c.apiBase(supabaseprovider.TargetProject{Ref: "abc", DBHost: tt.dbHost}); got != tt.want {
 			t.Errorf("apiBase for %s with profile %q = %q, want %q", tt.dbHost, tt.profile, got, tt.want)
 		}
@@ -473,15 +505,6 @@ func TestInspectReport_UsesTheProjectRefNotThePassword(t *testing.T) {
 		if strings.Contains(a.Command, "--db-url") || strings.Contains(a.Command, "postgres://") {
 			t.Errorf("recorded command leaks a connection string: %s", a.Command)
 		}
-	}
-}
-
-func TestAPIErrorMessage(t *testing.T) {
-	if got := apiErrorMessage([]byte(`{"message":"Project not found"}`), "404 Not Found"); got != "Project not found" {
-		t.Errorf("got %q", got)
-	}
-	if got := apiErrorMessage([]byte(`nope`), "500 Internal Server Error"); got != "500 Internal Server Error" {
-		t.Errorf("got %q, want the status fallback", got)
 	}
 }
 

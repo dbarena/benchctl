@@ -1,5 +1,7 @@
-// Package supabase implements a TargetProvider that provisions a Supabase
-// cloud database project via the Supabase CLI (beta channel).
+// Package supabase implements a TargetProvider that provisions Supabase cloud
+// database projects via the Supabase CLI (beta channel). With
+// config.management_api: true it calls the Management API directly instead
+// (see mgmt).
 package supabase
 
 import (
@@ -245,6 +247,15 @@ type providerConfig struct {
 	ProjectCount        int
 	MaxParallelProjects int
 	ConnectionMode      string
+
+	// The Management API path (see mgmt).
+	ManagementAPI     bool
+	ManagementAPIURL  string
+	ThrottleSkipToken string
+	RequireHostSuffix string
+	MaxFailedProjects int
+	ReadyTimeout      time.Duration
+
 	DiskSizeGB          int
 	DiskIOPS            int
 	DiskThroughputMibps int
@@ -309,7 +320,7 @@ func parseConfig(cfg map[string]any) (providerConfig, error) {
 	default:
 		return c, fmt.Errorf("config.disk_type %q is invalid: must be gp3 or io2", c.DiskType)
 	}
-	return c, nil
+	return parseManagementAPIConfig(cfg, c)
 }
 
 // parseIntConfig coerces cfg[key] (arriving as a string post-templating, or
@@ -396,7 +407,13 @@ func parsePositiveIntConfig(cfg map[string]any, key string, def int) (int, error
 // Outputs always include project_refs, plus api_url_<ref> and
 // publishable_key_<ref> for each project. A single project also gets host,
 // port, user and project_ref.
+//
+// With management_api: true, the projects are created through the Management
+// API instead (see mgmt.provision for its keys and outputs).
 func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]any) (engine.Outputs, error) {
+	if boolConfig(cfg["management_api"]) {
+		return mgmt{p}.provision(ctx, runID, cfg)
+	}
 	if err := p.checkCLIOrDefault(); err != nil {
 		return nil, err
 	}
@@ -460,6 +477,7 @@ type project struct {
 	ref            string
 	dbHost         string
 	publishableKey string
+	ready          bool // set by the Management API path only
 }
 
 // provisionRun holds what every project in a run shares.
@@ -552,6 +570,9 @@ func (p *Provider) TeardownSeed(runID string, cfg map[string]any) engine.Outputs
 	c, err := parseConfig(cfg)
 	if err != nil {
 		return nil
+	}
+	if c.ManagementAPI {
+		return mgmtRefOutputs(c, runID, nil)
 	}
 	return refOutputs(c, runID, nil)
 }
@@ -782,6 +803,11 @@ func notReadyForDeletion(stdout, stderr []byte) bool {
 // project named after the run. On success it also removes the local per-run
 // working directory (see workDirForRun).
 func (p *Provider) Teardown(ctx context.Context, outputs engine.Outputs) error {
+	// The seed records the path that created the projects. Runs from before it
+	// existed have no such key, and go through the CLI.
+	if outputs[outputKeyManagementAPI] == "true" {
+		return mgmt{p}.teardown(ctx, outputs)
+	}
 	refs, names := projectRefs(outputs), runProjectNames(outputs)
 	if len(refs) == 0 && len(names) == 0 {
 		return fmt.Errorf("supabase: teardown: missing %s in outputs", outputKeyProjectRefs)
@@ -863,6 +889,11 @@ func (p *Provider) removeWorkDir(dir string) {
 // collector metadata under the label key "project_id". A run with several
 // projects gets their refs comma-separated, in creation order.
 func (p *Provider) RunMetadata(outputs engine.Outputs) map[string]string {
+	// A Management API run with several projects reports a count: its outputs
+	// hold no refs.
+	if n := outputs[outputKeyProjectsReady]; n != "" {
+		return map[string]string{"project_count": n}
+	}
 	if refs := projectRefs(outputs); len(refs) > 0 {
 		return map[string]string{"project_id": strings.Join(refs, ",")}
 	}
@@ -1177,16 +1208,28 @@ func projectRefByName(data []byte, name, orgID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return refByName(projects, name, orgID)
+}
+
+// refByName is projectRefByName for an already parsed list.
+func refByName(projects []listedProject, name, orgID string) (string, error) {
 	for _, p := range projects {
 		if p.Name != name {
 			continue
 		}
-		if orgID != "" && p.OrganizationID != orgID && p.OrganizationSlug != orgID {
+		if !inOrg(p, orgID) {
 			continue
 		}
 		return p.Ref, nil
 	}
 	return "", fmt.Errorf("no project named %q found in projects list", name)
+}
+
+// inOrg reports whether lp belongs to orgID. The API reports the org as both
+// organization_id and organization_slug; either matching is enough. An empty
+// orgID matches every project.
+func inOrg(lp listedProject, orgID string) bool {
+	return orgID == "" || lp.OrganizationID == orgID || lp.OrganizationSlug == orgID
 }
 
 // connectionDetails returns the host, port, and user for the given connection
@@ -1269,6 +1312,13 @@ func poolerHost(dbHost, region string) string {
 // live where the POST returned 201 but the disk's
 // real attributes never changed.
 func (p *Provider) resizeDiskIfNeeded(ctx context.Context, profile, dbHost, ref string, sizeGB, iops, throughputMibps int, diskType string) error {
+	url := ManagementAPIBase(profile, dbHost) + "/v1/projects/" + ref + "/config/disk"
+	return p.resizeDisk(ctx, url, sizeGB, iops, throughputMibps, diskType)
+}
+
+// resizeDisk is resizeDiskIfNeeded for the disk-config endpoint at url, which
+// the Management API path takes from its own API base.
+func (p *Provider) resizeDisk(ctx context.Context, url string, sizeGB, iops, throughputMibps int, diskType string) error {
 	if sizeGB == 0 {
 		return nil
 	}
@@ -1282,7 +1332,6 @@ func (p *Provider) resizeDiskIfNeeded(ctx context.Context, profile, dbHost, ref 
 	if token == "" {
 		return fmt.Errorf("resize disk: no access token (set BENCHCTL_SUPABASE_ACCESS_TOKEN)")
 	}
-	url := ManagementAPIBase(profile, dbHost) + "/v1/projects/" + ref + "/config/disk"
 
 	current, err := p.getDiskAttrs(ctx, url, token)
 	if err != nil {
@@ -1421,20 +1470,41 @@ type TargetProject struct {
 	DBHost string
 }
 
-// TargetProjects returns every project listed in a run's outputs, in creation
-// order. The DB host comes from the project's api_url_<ref>; runs from before
-// that key existed only recorded host, for their single project.
-func TargetProjects(outputs engine.Outputs) []TargetProject {
+// TargetProjects returns the projects a run's outputs describe. A Management
+// API run with several projects has none listed in its outputs: these are the
+// ready ones in its manifest, in the order they became ready. Otherwise they
+// come from the listed refs, in creation order, with the DB host from the
+// project's api_url_<ref>; runs from before that key existed only recorded
+// host, for their single project.
+func TargetProjects(outputs engine.Outputs) ([]TargetProject, error) {
+	if path := outputs[outputKeyProjectsManifest]; path != "" {
+		events, err := readManifest(path)
+		if err != nil {
+			return nil, err
+		}
+		var projects []TargetProject
+		for _, ev := range events {
+			if ev.E == eventReady {
+				projects = append(projects, TargetProject{Ref: ev.Ref, DBHost: dbHost(ev.APIURL)})
+			}
+		}
+		return projects, nil
+	}
 	refs := projectRefs(outputs)
 	projects := make([]TargetProject, len(refs))
 	for i, ref := range refs {
 		host := outputs["host"]
 		if u := outputs[outputKeyAPIURL+ref]; u != "" {
-			host = "db." + strings.TrimPrefix(u, "https://")
+			host = dbHost(u)
 		}
 		projects[i] = TargetProject{Ref: ref, DBHost: host}
 	}
-	return projects
+	return projects, nil
+}
+
+// dbHost is the inverse of apiURL.
+func dbHost(apiURL string) string {
+	return "db." + strings.TrimPrefix(apiURL, "https://")
 }
 
 // redactArgs returns args as a single string with --db-password values hidden.
