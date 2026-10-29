@@ -546,3 +546,57 @@ func TestRunAsync_BootstrapFails_KeepsOwnership(t *testing.T) {
 		t.Error("expected the failed run to be terminal")
 	}
 }
+
+// seedingTarget is a stubTarget that can find its infrastructure from the run
+// ID alone, like the Supabase provider.
+type seedingTarget struct {
+	stubTarget
+	onProvision  func(runID string)
+	tornDownWith engine.Outputs
+}
+
+func (s *seedingTarget) TeardownSeed(runID string, _ map[string]any) engine.Outputs {
+	return engine.Outputs{"run_id": runID}
+}
+
+func (s *seedingTarget) Provision(ctx context.Context, runID string, cfg map[string]any) (engine.Outputs, error) {
+	s.onProvision(runID)
+	return s.stubTarget.Provision(ctx, runID, cfg)
+}
+
+func (s *seedingTarget) Teardown(ctx context.Context, outputs engine.Outputs) error {
+	s.tornDownWith = outputs
+	return s.stubTarget.Teardown(ctx, outputs)
+}
+
+// TestRunAsync_ProvisionTargetFailsWithoutOutputs_TearsDownFromSeed covers a
+// provision that fails, or a benchctl that dies, before the target reports
+// what it created: the seed is already in the store, and teardown uses it.
+func TestRunAsync_ProvisionTargetFailsWithoutOutputs_TearsDownFromSeed(t *testing.T) {
+	var calls []string
+	store := newMemStore()
+	var seededBeforeProvision bool
+	target := &seedingTarget{stubTarget: stubTarget{calls: &calls, provisionErr: errors.New("target boom")}}
+	target.onProvision = func(runID string) {
+		st, err := store.Load(runID)
+		seededBeforeProvision = err == nil && st.TargetOutputs["run_id"] == runID
+	}
+	r := engine.Runner{
+		Target:    target,
+		Driver:    &stubAsyncDriver{stubDriver: stubDriver{calls: &calls}},
+		Workloads: map[string]engine.WorkloadAdapter{"go-tpc": &stubWorkload{calls: &calls}},
+		Collector: &stubCollector{calls: &calls},
+		Store:     store,
+	}
+
+	runID, err := r.RunAsync(context.Background(), asyncScenario(), schema.ResolvedInputs{"warehouses": int64(10)})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !seededBeforeProvision {
+		t.Error("the teardown seed was not in the store when Provision started")
+	}
+	if target.tornDownWith["run_id"] != runID {
+		t.Errorf("Teardown outputs = %v, want the seed for %s", target.tornDownWith, runID)
+	}
+}

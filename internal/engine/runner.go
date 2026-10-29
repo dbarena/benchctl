@@ -38,6 +38,28 @@ import (
 // SIGKILL) and leaks whatever it had not reached yet.
 const selfTeardownTimeout = 30 * time.Minute
 
+// runSelfTeardown runs teardowns in reverse order with a fresh context bounded
+// by timeout: the run context may already be cancelled (e.g. Ctrl+C), and we
+// must stop infrastructure regardless. It stops at the first failure as a
+// later-provisioned resource (e.g. a co-located driver instance inside the
+// target's VPC) can still be attached to an earlier-provisioned one, so
+// tearing down the earlier one risks the same dependency-violation failure
+// mode benchctl teardown guards against. When timeout runs out, the error
+// tells the user to finish with `benchctl teardown`, which has no timeout.
+func runSelfTeardown(teardowns []func(context.Context) error, runID string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for i := len(teardowns) - 1; i >= 0; i-- {
+		if err := teardowns[i](ctx); err != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return fmt.Errorf("teardown: ran out of time after %s; finish with: benchctl teardown %s: %w", timeout, runID, err)
+			}
+			return fmt.Errorf("teardown: %w", err)
+		}
+	}
+	return nil
+}
+
 // Runner drives a scenario through the full benchmark lifecycle:
 //
 //	provision → driver.setup → workload.execute → driver.collect → teardown
@@ -160,22 +182,7 @@ func (r *Runner) Run(ctx context.Context, s *schema.Scenario, inputs schema.Reso
 			r.setState(runID, func(st *runstate.State) {
 				st.Phases[runstate.PhaseTeardown] = runstate.StatusRunning
 			})
-			// Use a fresh context for teardown: the run context may already be
-			// cancelled (e.g. Ctrl+C), and we must stop infrastructure regardless.
-			tdCtx, tdCancel := context.WithTimeout(context.Background(), selfTeardownTimeout)
-			defer tdCancel()
-			var tdErr error
-			// Stop at the first failure as a later-provisioned resource
-			// (e.g. a co-located driver instance inside the target's VPC)
-			// can still be attached to an earlier-provisioned one, so
-			// tearing down the earlier one risks the same dependency-violation
-			// failure mode benchctl teardown guards against.
-			for i := len(teardowns) - 1; i >= 0; i-- {
-				if err := teardowns[i](tdCtx); err != nil {
-					tdErr = errors.Join(tdErr, fmt.Errorf("teardown: %w", err))
-					break
-				}
-			}
+			tdErr := runSelfTeardown(teardowns, runID, selfTeardownTimeout)
 			runErr = errors.Join(runErr, tdErr)
 			now := time.Now().UTC()
 			r.setState(runID, func(st *runstate.State) {
@@ -239,12 +246,17 @@ func (r *Runner) Run(ctx context.Context, s *schema.Scenario, inputs schema.Reso
 	if err != nil {
 		return fmt.Errorf("resolve target config: %w", err)
 	}
+	teardownSeed := r.seedTargetTeardown(runID, targetCfg)
 	rawTargetOutputs, err := r.Target.Provision(ctx, runID, targetCfg)
 	if err != nil {
+		if len(rawTargetOutputs) == 0 {
+			rawTargetOutputs = teardownSeed
+		}
 		if len(rawTargetOutputs) > 0 {
 			// Provision failed partway through (e.g. disk resize after project
 			// create) but returned partial outputs identifying real
-			// infrastructure whose own rollback failed. Register it for
+			// infrastructure whose own rollback failed, or the target can find
+			// its infrastructure from the seed alone. Register it for
 			// teardown like a normal successful provision.
 			teardowns = append(teardowns, func(ctx context.Context) error {
 				r.logf("Tearing down target [%s]", s.Target.Provider)
@@ -541,19 +553,7 @@ func (r *Runner) RunAsync(ctx context.Context, s *schema.Scenario, inputs schema
 		ranTeardown := false
 		if !skipTeardown && len(teardowns) > 0 {
 			ranTeardown = true
-			tdCtx, tdCancel := context.WithTimeout(context.Background(), selfTeardownTimeout)
-			defer tdCancel()
-			// Stop at the first failure: a later-provisioned resource (e.g.
-			// the driver) can depend on an earlier one, so tearing down the
-			// earlier one after a later teardown failed risks the same
-			// dependency-violation failure mode benchctl teardown guards
-			// against; see Run()'s defer for the same rationale.
-			for i := len(teardowns) - 1; i >= 0; i-- {
-				if err := teardowns[i](tdCtx); err != nil {
-					tdErr = errors.Join(tdErr, fmt.Errorf("teardown: %w", err))
-					break
-				}
-			}
+			tdErr = runSelfTeardown(teardowns, runID, selfTeardownTimeout)
 			runErr = errors.Join(runErr, tdErr)
 		} else if r.LingerOnFailure && len(teardowns) > 0 {
 			r.logf("Run failed; infrastructure left running for inspection. Tear down with: benchctl teardown %s", runID)
@@ -592,12 +592,17 @@ func (r *Runner) RunAsync(ctx context.Context, s *schema.Scenario, inputs schema
 	if err != nil {
 		return runID, fmt.Errorf("resolve target config: %w", err)
 	}
+	teardownSeed := r.seedTargetTeardown(runID, targetCfg)
 	rawTargetOutputs, err := r.Target.Provision(ctx, runID, targetCfg)
 	if err != nil {
+		if len(rawTargetOutputs) == 0 {
+			rawTargetOutputs = teardownSeed
+		}
 		if len(rawTargetOutputs) > 0 {
 			// Provision failed partway through (e.g. disk resize after project
 			// create) but returned partial outputs identifying real
-			// infrastructure whose own rollback failed. Register it for
+			// infrastructure whose own rollback failed, or the target can find
+			// its infrastructure from the seed alone. Register it for
 			// teardown like a normal successful provision, and persist it so
 			// `benchctl teardown` can finish the job if that also fails.
 			teardowns = append(teardowns, func(ctx context.Context) error {
@@ -1498,6 +1503,24 @@ func formatFixture(combo schema.ResolvedFixture) string {
 func (r *Runner) storeIsShared() bool {
 	ss, ok := r.Store.(runstate.SharedStore)
 	return ok && ss.IsShared()
+}
+
+// seedTargetTeardown records the target's teardown seed (see TeardownSeeder)
+// as the run's target outputs before Provision starts, so `benchctl teardown`
+// has something to act on however provisioning ends. It returns the seed, or
+// nil when the target has none.
+func (r *Runner) seedTargetTeardown(runID string, cfg map[string]any) Outputs {
+	seeder, ok := r.Target.(TeardownSeeder)
+	if !ok {
+		return nil
+	}
+	seed := seeder.TeardownSeed(runID, cfg)
+	if len(seed) > 0 {
+		r.setState(runID, func(st *runstate.State) {
+			st.TargetOutputs = map[string]string(seed)
+		})
+	}
+	return seed
 }
 
 // packTofuState packs the OpenTofu working directories from targetOutputs and
