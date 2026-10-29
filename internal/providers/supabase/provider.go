@@ -15,8 +15,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dbarena/benchctl/internal/config"
@@ -26,6 +28,14 @@ import (
 
 const (
 	outputKeyProjectRef = "project_ref"
+	// outputKeyProjectRefs lists every project's ref, comma-separated, in
+	// creation order. Per-project details live under keys suffixed with the
+	// ref (see outputKeyAPIURL).
+	outputKeyProjectRefs = "project_refs"
+	// outputKeyAPIURL and outputKeyPublishableKey prefix a project's ref, e.g.
+	// api_url_abc123.
+	outputKeyAPIURL         = "api_url_"
+	outputKeyPublishableKey = "publishable_key_"
 
 	// outputKeyVendor declares which cloud this target runs on, so post-run tooling
 	// knows whose APIs and credentials apply.
@@ -36,6 +46,10 @@ const (
 	// _supabase_run_id stores the run ID so teardown can remove the local
 	// working directory on success.
 	outputKeyRunID = "_supabase_run_id"
+	// _supabase_project_count stores project_count. With the run ID it names
+	// every project the run could have created (see projectNames), so
+	// teardown finds the ones whose ref was never recorded.
+	outputKeyProjectCount = "_supabase_project_count"
 
 	pollInterval = 15 * time.Second
 	pollTimeout  = 10 * time.Minute
@@ -64,6 +78,22 @@ const (
 
 	diskTypeGP3 = "gp3"
 	diskTypeIO2 = "io2"
+
+	// defaultMaxParallelProjects caps how many projects Provision creates, and
+	// Teardown deletes, at once, so a large project_count doesn't flood the
+	// Management API. Provision's cap can be changed with max_parallel_projects.
+	defaultMaxParallelProjects = 10
+
+	// rateLimitRetries/defaultRateLimitBackoff bound how runCaptureErr retries
+	// a call the Management API rejected with 429. The API blocks a caller that
+	// exceeds its request limit for a while, so these retries span more than
+	// one block.
+	rateLimitRetries        = 4
+	defaultRateLimitBackoff = 30 * time.Second
+
+	// defaultDeleteRetryInterval is how often deleteProject retries a project
+	// the Management API won't delete yet.
+	defaultDeleteRetryInterval = 30 * time.Second
 )
 
 // httpDoer is satisfied by *http.Client; injected so tests can substitute a
@@ -121,6 +151,14 @@ type Provider struct {
 	// projects-list attempts. Zero means "use the default const above"; tests
 	// set a small value here to avoid a real wait.
 	recoverLookupInterval time.Duration
+
+	// rateLimitBackoff overrides the wait before runCaptureErr retries a
+	// rate-limited call. Zero means "use the default const above"; tests set
+	// a small value here to avoid a real wait.
+	rateLimitBackoff time.Duration
+	// deleteRetryInterval overrides defaultDeleteRetryInterval; tests set a
+	// small value here to avoid a real wait.
+	deleteRetryInterval time.Duration
 }
 
 func New(cfg *config.Config) *Provider {
@@ -162,6 +200,20 @@ func (p *Provider) recoverLookupIntervalOrDefault() time.Duration {
 	return defaultRecoverLookupInterval
 }
 
+func (p *Provider) rateLimitBackoffOrDefault() time.Duration {
+	if p.rateLimitBackoff > 0 {
+		return p.rateLimitBackoff
+	}
+	return defaultRateLimitBackoff
+}
+
+func (p *Provider) deleteRetryIntervalOrDefault() time.Duration {
+	if p.deleteRetryInterval > 0 {
+		return p.deleteRetryInterval
+	}
+	return defaultDeleteRetryInterval
+}
+
 // cliRunner returns p.run, falling back to execCLI for Providers constructed
 // as a bare struct literal (e.g. in tests that only set out/doer).
 func (p *Provider) cliRunner() cmdRunner {
@@ -190,6 +242,8 @@ type providerConfig struct {
 	PostgresEngine      string
 	Profile             string
 	ProjectSize         string
+	ProjectCount        int
+	MaxParallelProjects int
 	ConnectionMode      string
 	DiskSizeGB          int
 	DiskIOPS            int
@@ -208,9 +262,6 @@ func parseConfig(cfg map[string]any) (providerConfig, error) {
 		return c, fmt.Errorf("config.org_id is required")
 	}
 	c.ProjectSize, _ = cfg["project_size"].(string)
-	if c.ProjectSize == "" {
-		return c, fmt.Errorf("config.project_size is required")
-	}
 	c.ConnectionMode, _ = cfg["connection_mode"].(string)
 	switch c.ConnectionMode {
 	case connModeDirect, connModeSupavisorSession, connModeSupavisorTransaction:
@@ -235,6 +286,12 @@ func parseConfig(cfg map[string]any) (providerConfig, error) {
 	c.PostgresEngine, _ = cfg["postgres_engine"].(string)
 	c.Profile, _ = cfg["profile"].(string)
 	var err error
+	if c.ProjectCount, err = parsePositiveIntConfig(cfg, "project_count", 1); err != nil {
+		return c, err
+	}
+	if c.MaxParallelProjects, err = parsePositiveIntConfig(cfg, "max_parallel_projects", defaultMaxParallelProjects); err != nil {
+		return c, err
+	}
 	if c.DiskSizeGB, err = parseIntConfig(cfg, "disk_size_gb"); err != nil {
 		return c, err
 	}
@@ -277,13 +334,34 @@ func parseIntConfig(cfg map[string]any, key string) (int, error) {
 	return 0, nil
 }
 
-// Provision creates a new Supabase project and waits for it to become ready.
+// parsePositiveIntConfig is parseIntConfig for a key that must be at least 1,
+// returning def when the key is absent or zero.
+func parsePositiveIntConfig(cfg map[string]any, key string, def int) (int, error) {
+	n, err := parseIntConfig(cfg, key)
+	switch {
+	case err != nil:
+		return 0, err
+	case n == 0:
+		return def, nil
+	case n < 0:
+		return 0, fmt.Errorf("config.%s must be at least 1, got %d", key, n)
+	}
+	return n, nil
+}
+
+// Provision creates project_count Supabase projects, several at a time (see
+// max_parallel_projects), and waits for all of them to become ready.
 //
 // Expected config keys:
 //
 //	region           string   AWS region (required)
 //	org_id           string   Supabase organisation ID (required)
-//	project_size     string   instance size, e.g. "pico" (required)
+//	project_count    int      number of projects to create (optional, default 1)
+//	max_parallel_projects int how many projects to create at once (optional,
+//	                          default 10)
+//	project_size     string   instance size, e.g. "micro" (optional; when unset
+//	                          --size is omitted and the API picks the
+//	                          organisation's default size)
 //	connection_mode  string   direct | supavisor-session | supavisor-transaction (required)
 //	high_availability bool    enable Multigres HA (optional, default false)
 //	experimental     bool     pass --experimental to the CLI (optional, default
@@ -314,6 +392,10 @@ func parseIntConfig(cfg map[string]any, key string) (int, error) {
 //	disk_type        string   gp3 | io2 (optional, default "gp3"). gp3 caps
 //	                          out at min(500 IOPS/GB, 16,000); tiers whose
 //	                          documented IOPS exceed that need "io2" instead.
+//
+// Outputs always include project_refs, plus api_url_<ref> and
+// publishable_key_<ref> for each project. A single project also gets host,
+// port, user and project_ref.
 func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]any) (engine.Outputs, error) {
 	if err := p.checkCLIOrDefault(); err != nil {
 		return nil, err
@@ -324,29 +406,223 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 		return nil, fmt.Errorf("supabase: %w", err)
 	}
 
-	env := p.buildEnv()
-
 	workDir := workDirForRun(runID)
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return nil, fmt.Errorf("supabase: mkdir %s: %w", workDir, err)
 	}
 
+	// One password for every project in the run keeps the outputs small.
 	password, err := generatePassword()
 	if err != nil {
 		return nil, fmt.Errorf("supabase: generate password: %w", err)
 	}
+	env := p.buildEnv()
+	run := provisionRun{
+		cfg: c, env: env, runID: runID, workDir: workDir, password: password,
+		projects: p.sharedProjectsList(env, c.Profile, workDir),
+	}
+
+	// The first failure cancels the projects still being provisioned, and
+	// each of those cleans up after itself (see cleanUpFailedProject). It is
+	// also the cause reported: a cancelled project's CLI call fails with
+	// "signal: killed", which would otherwise hide what went wrong.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	names := projectNames(runID, c.ProjectCount)
+	projects := make([]project, len(names))
+	errs := make([]error, len(names))
+	ForEachParallel(len(names), c.MaxParallelProjects, func(i int) {
+		if errs[i] = ctx.Err(); errs[i] != nil {
+			return
+		}
+		projects[i], errs[i] = p.provisionProject(ctx, run, names[i])
+		if errs[i] != nil {
+			cancel(errs[i])
+		}
+	})
+	projects = slices.DeleteFunc(projects, func(pr project) bool { return pr.ref == "" })
+
+	if slices.ContainsFunc(errs, func(err error) bool { return err != nil }) {
+		err := context.Cause(ctx)
+		if len(projects) == 0 {
+			p.removeWorkDir(workDir)
+			return nil, err
+		}
+		// The runner tears down whatever these outputs still list.
+		return refOutputs(c, runID, projects), err
+	}
+	return run.outputs(projects), nil
+}
+
+// project is one provisioned Supabase project. After a failed provision only
+// ref is set, and only when the project still exists.
+type project struct {
+	ref            string
+	dbHost         string
+	publishableKey string
+}
+
+// provisionRun holds what every project in a run shares.
+type provisionRun struct {
+	cfg      providerConfig
+	env      []string
+	runID    string
+	workDir  string
+	password string
+	projects *projectsList
+}
+
+// projectsList shares `projects list` calls between every project a run is
+// waiting on, so polling N projects costs one Management API request per poll
+// interval rather than N. A caller gets the last response while it is younger
+// than maxAge; otherwise it fetches a new one, and concurrent callers wait for
+// that fetch rather than starting their own.
+type projectsList struct {
+	fetch  func(ctx context.Context) ([]byte, error)
+	maxAge time.Duration
+
+	mu      sync.Mutex
+	out     []byte
+	fetched time.Time
+}
+
+func (p *Provider) sharedProjectsList(env []string, profile, workDir string) *projectsList {
+	args := append(globalArgs(profile, workDir), "projects", "list", "--output-format", "json")
+	return &projectsList{
+		fetch:  func(ctx context.Context) ([]byte, error) { return p.runCapture(ctx, env, args...) },
+		maxAge: p.pollIntervalOrDefault(),
+	}
+}
+
+func (l *projectsList) get(ctx context.Context) ([]byte, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.out != nil && time.Since(l.fetched) < l.maxAge {
+		return l.out, nil
+	}
+	out, err := l.fetch(ctx)
+	if err != nil {
+		return out, err
+	}
+	l.out, l.fetched = out, time.Now()
+	return out, nil
+}
+
+// outputs builds the target outputs for a fully provisioned run.
+func (r provisionRun) outputs(projects []project) engine.Outputs {
+	out := refOutputs(r.cfg, r.runID, projects)
+	out["password"] = r.password
+	out["db"] = "postgres"
+	// Supabase projects always require TLS; sslnegotiation=direct skips the
+	// plaintext SSLRequest round trip in favor of an immediate TLS handshake.
+	out["sslmode"] = "require"
+	out["sslnegotiation"] = "direct"
+	out[outputKeyVendor] = "supabase"
+	for _, pr := range projects {
+		out[outputKeyAPIURL+pr.ref] = apiURL(pr.dbHost)
+		out[outputKeyPublishableKey+pr.ref] = pr.publishableKey
+	}
+	if len(projects) == 1 {
+		pr := projects[0]
+		out["host"], out["port"], out["user"] = connectionDetails(pr.dbHost, pr.ref, r.cfg.ConnectionMode, r.cfg.Region)
+		out[outputKeyProjectRef] = pr.ref
+	}
+	return out
+}
+
+// refOutputs returns what Teardown needs to delete the given projects, and any
+// other project the run created.
+func refOutputs(c providerConfig, runID string, projects []project) engine.Outputs {
+	refs := make([]string, len(projects))
+	for i, pr := range projects {
+		refs[i] = pr.ref
+	}
+	return engine.Outputs{
+		outputKeyProjectRefs:  strings.Join(refs, ","),
+		outputKeyProfile:      c.Profile,
+		outputKeyRunID:        runID,
+		outputKeyProjectCount: strconv.Itoa(c.ProjectCount),
+	}
+}
+
+// TeardownSeed implements engine.TeardownSeeder. Before any project exists,
+// the run ID, profile and project count are already enough for Teardown to
+// find every project the run goes on to create.
+func (p *Provider) TeardownSeed(runID string, cfg map[string]any) engine.Outputs {
+	c, err := parseConfig(cfg)
+	if err != nil {
+		return nil
+	}
+	return refOutputs(c, runID, nil)
+}
+
+// runProjectNames returns the names of every project the run in outputs could
+// have created. Runs recorded before project counts were stored return none.
+func runProjectNames(outputs engine.Outputs) []string {
+	count, err := strconv.Atoi(outputs[outputKeyProjectCount])
+	runID := outputs[outputKeyRunID]
+	if err != nil || count < 1 || runID == "" {
+		return nil
+	}
+	return projectNames(runID, count)
+}
+
+// projectRefs returns the refs listed in outputs. Runs provisioned before
+// project_count existed only recorded project_ref.
+func projectRefs(outputs engine.Outputs) []string {
+	if refs := outputs[outputKeyProjectRefs]; refs != "" {
+		return strings.Split(refs, ",")
+	}
+	if ref := outputs[outputKeyProjectRef]; ref != "" {
+		return []string{ref}
+	}
+	return nil
+}
+
+// projectNames names a run's projects after its run ID.
+func projectNames(runID string, count int) []string {
+	if count == 1 {
+		return []string{runID}
+	}
+	names := make([]string, count)
+	for i := range names {
+		names[i] = fmt.Sprintf("%s-%d", runID, i+1)
+	}
+	return names
+}
+
+func ForEachParallel(n, limit int, fn func(i int)) {
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i := range n {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			fn(i)
+		})
+	}
+	wg.Wait()
+}
+
+// provisionProject creates the project called name, waits for it to become
+// ready and fetches its publishable key. Any failure after the project exists goes
+// through cleanUpFailedProject.
+func (p *Provider) provisionProject(ctx context.Context, run provisionRun, name string) (project, error) {
+	c := run.cfg
 
 	// Build the create command. Profile and workdir are global flags placed
-	// before the subcommand; the project name is the run ID for traceability.
-	args := globalArgs(c.Profile, workDir)
+	// before the subcommand.
+	args := globalArgs(c.Profile, run.workDir)
 	args = append(args, "projects", "create",
 		"--region", c.Region,
 		"--yes",
 		"--output-format", "json",
 		"--org-id", c.OrgID,
-		"--db-password", password,
-		"--size", c.ProjectSize,
+		"--db-password", run.password,
 	)
+	if c.ProjectSize != "" {
+		args = append(args, "--size", c.ProjectSize)
+	}
 	if c.HighAvailability {
 		args = append(args, "--high-availability")
 	}
@@ -359,22 +635,22 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 	if c.PostgresEngine != "" {
 		args = append(args, "--postgres-engine", c.PostgresEngine)
 	}
-	args = append(args, runID) // positional: project name
+	args = append(args, name) // positional: project name
 
-	consolelog.Println(p.out, fmt.Sprintf("supabase: creating project %s in %s", runID, c.Region))
-	out, err := p.runCapture(ctx, env, args...)
+	consolelog.Println(p.out, fmt.Sprintf("supabase: creating project %s in %s", name, c.Region))
+	out, err := p.runCapture(ctx, run.env, args...)
 	if err != nil {
-		detail := cliErrorDetail(out)
+		detail := CLIErrorDetail(out)
 		createErr := fmt.Errorf("supabase: projects create: %w%s%s", err, detail, authHint(err.Error()+detail))
 		// A non-zero exit does not mean no project was created. The CLI retries
 		// POST /v1/projects on any transport error, so a connection dropped
 		// mid-create leaves the project behind and the retry fails with
 		// "Project with name ... already exists in your organization". Without
 		// this lookup that project is never torn down.
-		if ref := p.recoverCreatedProject(env, c.Profile, c.OrgID, workDir, runID); ref != "" {
-			return p.selfCleanupOrPartialOutputs(env, c.Profile, ref, runID, workDir, createErr)
+		if ref := p.recoverCreatedProject(run.env, c.Profile, c.OrgID, run.workDir, name); ref != "" {
+			return p.cleanUpFailedProject(run, ref, createErr)
 		}
-		return nil, createErr
+		return project{}, createErr
 	}
 
 	ref, err := parseProjectRef(out)
@@ -382,54 +658,41 @@ func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]a
 		createErr := fmt.Errorf("supabase: parse project ref: %w", err)
 		// The create call itself succeeded (exit 0), so a project may well
 		// exist even though its ref couldn't be extracted from the response.
-		if foundRef := p.recoverCreatedProject(env, c.Profile, c.OrgID, workDir, runID); foundRef != "" {
-			return p.selfCleanupOrPartialOutputs(env, c.Profile, foundRef, runID, workDir, createErr)
+		if foundRef := p.recoverCreatedProject(run.env, c.Profile, c.OrgID, run.workDir, name); foundRef != "" {
+			return p.cleanUpFailedProject(run, foundRef, createErr)
 		}
-		return nil, createErr
+		return project{}, createErr
 	}
-	consolelog.Println(p.out, fmt.Sprintf("supabase: project created with ref %s, waiting for ACTIVE_HEALTHY", ref))
+	consolelog.Println(p.out, fmt.Sprintf("supabase: project %s created with ref %s, waiting for ACTIVE_HEALTHY", name, ref))
 
-	dbHost, err := p.waitForProject(ctx, env, c.Profile, workDir, ref, c.ConnectionMode)
+	dbHost, err := p.waitForProject(ctx, run.projects, ref, c.ConnectionMode)
 	if err != nil {
-		return p.selfCleanupOrPartialOutputs(env, c.Profile, ref, runID, workDir, fmt.Errorf("supabase: %w", err))
+		return p.cleanUpFailedProject(run, ref, fmt.Errorf("supabase: %w", err))
 	}
 
-	if err := p.resizeDiskIfNeeded(ctx, dbHost, ref, c.DiskSizeGB, c.DiskIOPS, c.DiskThroughputMibps, c.DiskType); err != nil {
-		return p.selfCleanupOrPartialOutputs(env, c.Profile, ref, runID, workDir, fmt.Errorf("supabase: %w", err))
+	if err := p.resizeDiskIfNeeded(ctx, c.Profile, dbHost, ref, c.DiskSizeGB, c.DiskIOPS, c.DiskThroughputMibps, c.DiskType); err != nil {
+		return p.cleanUpFailedProject(run, ref, fmt.Errorf("supabase: %w", err))
 	}
 
-	host, port, user := connectionDetails(dbHost, ref, c.ConnectionMode, c.Region)
-
-	outputs := engine.Outputs{
-		"host":     host,
-		"port":     port,
-		"user":     user,
-		"password": password,
-		"db":       "postgres",
-		// Supabase projects always require TLS; sslnegotiation=direct skips the
-		// plaintext SSLRequest round trip in favor of an immediate TLS handshake.
-		"sslmode":           "require",
-		"sslnegotiation":    "direct",
-		outputKeyProjectRef: ref,
-		outputKeyProfile:    c.Profile,
-		outputKeyRunID:      runID,
-		outputKeyVendor:     "supabase",
+	publishableKey, err := p.publishableKey(ctx, run.env, c.Profile, run.workDir, ref)
+	if err != nil {
+		return p.cleanUpFailedProject(run, ref, fmt.Errorf("supabase: %w", err))
 	}
-	return outputs, nil
+
+	return project{ref: ref, dbHost: dbHost, publishableKey: publishableKey}, nil
 }
 
-// recoverCreatedProject returns the ref of the project named runID, or "" if
+// recoverCreatedProject returns the ref of the project called name, or "" if
 // there is none. It is the fallback for every way `projects create` can leave a
 // live project without reporting its ref: a non-zero exit after the API already
 // created it, or an exit 0 without a parseable ref in the response body.
-// Project names are always the run ID (see the positional arg in Provision).
 //
 // The lookup runs on a fresh context because the run context may be the very
 // reason create failed, and it retries a few times because the API can take a
 // moment to list a just-created project. Recovery is best effort: any error
 // yields "" so the caller reports the original create failure unchanged.
-func (p *Provider) recoverCreatedProject(env []string, profile, orgID, workDir, runID string) string {
-	consolelog.Println(p.out, fmt.Sprintf("supabase: create did not yield a project ref; checking projects list by name %s", runID))
+func (p *Provider) recoverCreatedProject(env []string, profile, orgID, workDir, name string) string {
+	consolelog.Println(p.out, fmt.Sprintf("supabase: create did not yield a project ref; checking projects list by name %s", name))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -437,7 +700,7 @@ func (p *Provider) recoverCreatedProject(env []string, profile, orgID, workDir, 
 	args := globalArgs(profile, workDir)
 	args = append(args, "projects", "list", "--output-format", "json")
 
-	for attempt := 0; attempt < recoverLookupAttempts; attempt++ {
+	for attempt := range recoverLookupAttempts {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -449,111 +712,168 @@ func (p *Provider) recoverCreatedProject(env []string, profile, orgID, workDir, 
 		if err != nil {
 			continue
 		}
-		ref, err := projectRefByName(out, runID, orgID)
+		ref, err := projectRefByName(out, name, orgID)
 		if err != nil {
 			continue
 		}
 		consolelog.Println(p.out, fmt.Sprintf("supabase: found project %s by name", ref))
 		return ref
 	}
-	consolelog.Println(p.out, fmt.Sprintf("supabase: no project named %s exists; nothing to clean up", runID))
+	consolelog.Println(p.out, fmt.Sprintf("supabase: no project named %s exists; nothing to clean up", name))
 	return ""
 }
 
-// selfCleanupOrPartialOutputs is called when a provisioning step fails after a
-// project has already been created (ref is known). It attempts to delete the
-// project itself, using a fresh background context so a cancelled/expired run
-// context (e.g. Ctrl+C, an ACTIVE_HEALTHY poll timeout) doesn't also abort the
-// cleanup. If self-cleanup succeeds, the local workdir is removed and the
-// original error is returned with no outputs (nothing left to tear down). If
-// self-cleanup itself fails, it returns enough outputs (project_ref, profile,
-// run_id) for `benchctl teardown <run-id>` to finish the job manually.
-func (p *Provider) selfCleanupOrPartialOutputs(env []string, profile, ref, runID, workDir string, origErr error) (engine.Outputs, error) {
+// cleanUpFailedProject is called when a provisioning step fails after the
+// project with the given ref has already been created. It deletes the project
+// using a fresh background context, so a cancelled/expired run context (e.g.
+// Ctrl+C, an ACTIVE_HEALTHY poll timeout, another project's failure) doesn't
+// also abort the cleanup. If the delete fails, the returned project carries
+// the ref so `benchctl teardown <run-id>` can finish the job.
+func (p *Provider) cleanUpFailedProject(run provisionRun, ref string, origErr error) (project, error) {
 	consolelog.Println(p.out, fmt.Sprintf("supabase: provisioning failed; deleting project %s to avoid an orphaned resource", ref))
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cleanupCancel()
-	if delErr := p.deleteProject(cleanupCtx, env, profile, ref); delErr != nil {
+	if delErr := p.deleteProject(cleanupCtx, run.env, run.cfg.Profile, ref); delErr != nil {
 		fmt.Fprintf(p.out, "warning: supabase: cleanup after failed provision: delete project %s: %v%s\n", ref, delErr, authHint(delErr.Error()))
-		return engine.Outputs{
-			outputKeyProjectRef: ref,
-			outputKeyProfile:    profile,
-			outputKeyRunID:      runID,
-		}, fmt.Errorf("%w (cleanup failed: run 'benchctl teardown %s' to delete project %s manually)", origErr, runID, ref)
+		return project{ref: ref}, fmt.Errorf("%w (cleanup failed: run 'benchctl teardown %s' to delete project %s manually)", origErr, run.runID, ref)
 	}
-	if rmErr := os.RemoveAll(workDir); rmErr != nil && !os.IsNotExist(rmErr) {
-		fmt.Fprintf(p.out, "warning: supabase: remove workdir %s: %v\n", workDir, rmErr)
-	}
-	return nil, origErr
+	return project{}, origErr
 }
 
 // deleteProject deletes the Supabase project identified by ref via the CLI.
+//
+// The Management API refuses to delete a project that is still coming up
+// until up to 15 minutes after its last status change, so a project caught
+// mid-provision is retried until it can go, or ctx ends.
 func (p *Provider) deleteProject(ctx context.Context, env []string, profile, ref string) error {
 	args := globalArgs(profile)
 	args = append(args, "projects", "delete", "--yes", ref)
 	consolelog.Println(p.out, fmt.Sprintf("supabase: deleting project %s", ref))
-	if out, stderr, err := p.runCaptureErr(ctx, env, args...); err != nil {
-		if alreadyDeleted(stderr) {
+	for {
+		out, stderr, err := p.runCaptureErr(ctx, env, args...)
+		switch {
+		case err == nil:
+			return nil
+		case alreadyDeleted(stderr):
 			consolelog.Println(p.out, fmt.Sprintf("supabase: project %s already deleted, treating teardown as successful", ref))
-		} else {
-			detail := cliErrorDetail(out)
+			return nil
+		case notReadyForDeletion(out, stderr) && ctx.Err() == nil:
+			wait := p.deleteRetryIntervalOrDefault()
+			consolelog.Println(p.out, fmt.Sprintf("supabase: project %s is still coming up and can't be deleted yet, retrying in %s", ref, wait))
+			select {
+			case <-ctx.Done():
+			case <-time.After(wait):
+			}
+		default:
+			detail := CLIErrorDetail(out)
 			return fmt.Errorf("supabase: projects delete %s: %w%s%s", ref, err, detail, authHint(err.Error()+detail))
 		}
 	}
-	return nil
 }
 
-// Teardown deletes the Supabase project identified by project_ref in outputs.
-// On success it also removes the local per-run working directory (see
-// workDirForRun).
+// notReadyForDeletion reports whether a failed delete hit the Management
+// API's block on deleting a project that is still being created.
+func notReadyForDeletion(stdout, stderr []byte) bool {
+	const msg = "not ready for deletion"
+	return bytes.Contains(stdout, []byte(msg)) || bytes.Contains(stderr, []byte(msg))
+}
+
+// Teardown deletes every Supabase project listed in outputs, and any other
+// project named after the run. On success it also removes the local per-run
+// working directory (see workDirForRun).
 func (p *Provider) Teardown(ctx context.Context, outputs engine.Outputs) error {
-	ref := outputs[outputKeyProjectRef]
-	if ref == "" {
-		return fmt.Errorf("supabase: teardown: missing %s in outputs", outputKeyProjectRef)
+	refs, names := projectRefs(outputs), runProjectNames(outputs)
+	if len(refs) == 0 && len(names) == 0 {
+		return fmt.Errorf("supabase: teardown: missing %s in outputs", outputKeyProjectRefs)
 	}
 
 	if err := p.checkCLIOrDefault(); err != nil {
 		return err
 	}
 	profile := outputs[outputKeyProfile]
-	runID := outputs[outputKeyRunID]
 
 	env := p.buildEnv()
 
-	// deleteProject passes no --workdir: the local state dir won't exist on a
-	// fresh CI runner and project deletion only needs the project_ref and auth
-	// token. It also treats an already-removed project as success, so a
-	// redundant teardown (after a provisioning rollback, a retry, or a manual
-	// delete) doesn't turn into a hard failure that leaves the run
-	// un-terminated.
-	if err := p.deleteProject(ctx, env, profile, ref); err != nil {
+	// Neither call passes --workdir: the local state dir won't exist on a
+	// fresh CI runner, and deletion only needs the refs and auth token.
+	refs, err := p.existingRefs(ctx, env, profile, refs, names)
+	if err != nil {
+		return err
+	}
+	errs := make([]error, len(refs))
+	ForEachParallel(len(refs), defaultMaxParallelProjects, func(i int) {
+		errs[i] = p.deleteProject(ctx, env, profile, refs[i])
+	})
+	if err := errors.Join(errs...); err != nil {
 		return err
 	}
 
 	// Remove local state only after a successful delete so the workdir
 	// remains for debugging on any failure.
-	if runID != "" {
-		wd := workDirForRun(runID)
-		if err := os.RemoveAll(wd); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(p.out, "warning: supabase: remove workdir %s: %v\n", wd, err)
-		}
+	if runID := outputs[outputKeyRunID]; runID != "" {
+		p.removeWorkDir(workDirForRun(runID))
 	}
 	return nil
+}
+
+// existingRefs returns the refs that `projects list` still lists, so a
+// redundant teardown (after a provisioning rollback, a retry, or a manual
+// delete) succeeds instead of leaving the run un-terminated. Deleting a
+// project that's already gone can't be told apart from a real failure: the
+// API answers 403, because access to the project went with it.
+//
+// It adds any listed project with one of the given names. That catches the
+// projects whose ref never reached the run's outputs: benchctl was killed
+// mid-provision, or a create's response was lost.
+func (p *Provider) existingRefs(ctx context.Context, env []string, profile string, refs, names []string) ([]string, error) {
+	args := append(globalArgs(profile), "projects", "list", "--output-format", "json")
+	out, err := p.runCapture(ctx, env, args...)
+	if err != nil {
+		detail := CLIErrorDetail(out)
+		return nil, fmt.Errorf("supabase: projects list: %w%s%s", err, detail, authHint(err.Error()+detail))
+	}
+	listed, err := parseProjectsList(out)
+	if err != nil {
+		return nil, fmt.Errorf("supabase: %w", err)
+	}
+	existing := slices.DeleteFunc(slices.Clone(refs), func(ref string) bool {
+		gone := !slices.ContainsFunc(listed, func(lp listedProject) bool { return lp.Ref == ref })
+		if gone {
+			consolelog.Println(p.out, fmt.Sprintf("supabase: project %s already deleted", ref))
+		}
+		return gone
+	})
+	for _, lp := range listed {
+		if slices.Contains(names, lp.Name) && !slices.Contains(refs, lp.Ref) {
+			consolelog.Println(p.out, fmt.Sprintf("supabase: found project %s by name (%s)", lp.Ref, lp.Name))
+			existing = append(existing, lp.Ref)
+		}
+	}
+	return existing, nil
+}
+
+// removeWorkDir removes a run's local working directory, warning on failure.
+func (p *Provider) removeWorkDir(dir string) {
+	if err := os.RemoveAll(dir); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(p.out, "warning: supabase: remove workdir %s: %v\n", dir, err)
+	}
 }
 
 // RunMetadata implements engine.TargetMetadata, surfacing the project id as
-// collector metadata under the label key "project_id".
+// collector metadata under the label key "project_id". A run with several
+// projects gets their refs comma-separated, in creation order.
 func (p *Provider) RunMetadata(outputs engine.Outputs) map[string]string {
-	if ref := outputs[outputKeyProjectRef]; ref != "" {
-		return map[string]string{"project_id": ref}
+	if refs := projectRefs(outputs); len(refs) > 0 {
+		return map[string]string{"project_id": strings.Join(refs, ",")}
 	}
 	return nil
 }
 
-// waitForProject polls supabase projects list until the project with the given
-// ref reaches ACTIVE_HEALTHY status, then returns the database host. If
+// waitForProject polls the run's projects list until the project with the
+// given ref reaches ACTIVE_HEALTHY status, then returns the database host. If
 // connectionMode uses the Supavisor pooler, it additionally waits poolerGrace
 // for tenant registration before returning.
-func (p *Provider) waitForProject(ctx context.Context, env []string, profile, workDir, ref, connectionMode string) (string, error) {
+func (p *Provider) waitForProject(ctx context.Context, projects *projectsList, ref, connectionMode string) (string, error) {
 	timeout := p.pollTimeoutOrDefault()
 	interval := p.pollIntervalOrDefault()
 	deadline := time.Now().Add(timeout)
@@ -561,11 +881,9 @@ func (p *Provider) waitForProject(ctx context.Context, env []string, profile, wo
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("project %s did not become ready within %s", ref, timeout)
 		}
-		args := globalArgs(profile, workDir)
-		args = append(args, "projects", "list", "--output-format", "json")
-		out, err := p.runCapture(ctx, env, args...)
+		out, err := projects.get(ctx)
 		if err != nil {
-			detail := cliErrorDetail(out)
+			detail := CLIErrorDetail(out)
 			return "", fmt.Errorf("projects list: %w%s%s", err, detail, authHint(err.Error()+detail))
 		}
 		status, host, err := projectStatusAndHost(out, ref)
@@ -573,7 +891,7 @@ func (p *Provider) waitForProject(ctx context.Context, env []string, profile, wo
 			if !errors.Is(err, errProjectNotListed) {
 				return "", err
 			}
-			consolelog.Println(p.out, "supabase: project not yet visible in projects list, retrying")
+			consolelog.Println(p.out, fmt.Sprintf("supabase: project %s not yet visible in projects list, retrying", ref))
 			select {
 			case <-ctx.Done():
 				return "", ctx.Err()
@@ -581,7 +899,7 @@ func (p *Provider) waitForProject(ctx context.Context, env []string, profile, wo
 			}
 			continue
 		}
-		consolelog.Println(p.out, fmt.Sprintf("supabase: project status: %s", status))
+		consolelog.Println(p.out, fmt.Sprintf("supabase: project %s status: %s", ref, status))
 		if status == "ACTIVE_HEALTHY" {
 			if !usesPooler(connectionMode) {
 				return host, nil
@@ -620,9 +938,32 @@ func (p *Provider) runCapture(ctx context.Context, env []string, args ...string)
 // still forwarded live to p.out (via io.MultiWriter) so progress output is
 // unaffected. Callers need stderr to tell apart error conditions that
 // cmd.Run()'s error hides; an ExitError carries no message text of its own.
+//
+// A call the Management API rate limits is retried (see rateLimitRetries),
+// since the CLI itself only retries 5xx responses. The limiter rejects a
+// request before its handler runs, so this is safe even for projects create.
 func (p *Provider) runCaptureErr(ctx context.Context, env []string, args ...string) (stdout, stderr []byte, err error) {
-	fmt.Fprintf(p.out, "$ supabase %s\n", redactArgs(args))
-	return p.cliRunner()(ctx, env, p.out, args...)
+	for attempt := 0; ; attempt++ {
+		fmt.Fprintf(p.out, "$ supabase %s\n", redactArgs(args))
+		stdout, stderr, err = p.cliRunner()(ctx, env, p.out, args...)
+		if err == nil || !rateLimited(stdout, stderr) || attempt == rateLimitRetries {
+			return stdout, stderr, err
+		}
+		wait := p.rateLimitBackoffOrDefault()
+		consolelog.Println(p.out, fmt.Sprintf("supabase: rate limited by the Management API, retrying in %s", wait))
+		select {
+		case <-ctx.Done():
+			return stdout, stderr, err
+		case <-time.After(wait):
+		}
+	}
+}
+
+// rateLimited reports whether a failed CLI call was rejected with 429. The
+// error lands on stdout with --output-format json and on stderr otherwise.
+func rateLimited(stdout, stderr []byte) bool {
+	const msg = "Too Many Requests"
+	return bytes.Contains(stdout, []byte(msg)) || bytes.Contains(stderr, []byte(msg))
 }
 
 // globalArgs returns the CLI global flags (--profile and/or --workdir) that
@@ -690,7 +1031,7 @@ func alreadyDeleted(stderr []byte) bool {
 }
 
 // authHint returns a hint about authentication when the given text (an error
-// message, optionally combined with cliErrorDetail's output) looks auth-related.
+// message, optionally combined with CLIErrorDetail's output) looks auth-related.
 func authHint(msg string) string {
 	if strings.Contains(msg, "Unauthorized") || strings.Contains(msg, "401") ||
 		strings.Contains(msg, "token") || strings.Contains(msg, "login") {
@@ -699,14 +1040,14 @@ func authHint(msg string) string {
 	return ""
 }
 
-// cliErrorDetail extracts a human-readable detail string from JSON-formatted
+// CLIErrorDetail extracts a human-readable detail string from JSON-formatted
 // CLI stdout. With --output-format json, the CLI writes its error object to
 // stdout on failure, not stderr, so it never appears via the live stderr
 // forwarding in runCaptureErr; callers that discard stdout on error get a bare
 // "exit status 1" with no indication of what actually went wrong. Returns ""
 // if stdout isn't the CLI's JSON error shape (e.g. it's from --output-format
 // text, or empty).
-func cliErrorDetail(stdout []byte) string {
+func CLIErrorDetail(stdout []byte) string {
 	var e struct {
 		Tag   string `json:"_tag"`
 		Error struct {
@@ -738,22 +1079,76 @@ func parseProjectRef(data []byte) (string, error) {
 	return v.Ref, nil
 }
 
+// publishableKey fetches the project's publishable API key via `supabase
+// projects api-keys`. New projects have the legacy anon key disabled.
+func (p *Provider) publishableKey(ctx context.Context, env []string, profile, workDir, ref string) (string, error) {
+	args := globalArgs(profile, workDir)
+	args = append(args, "projects", "api-keys", "--project-ref", ref, "--output-format", "json")
+	out, err := p.runCapture(ctx, env, args...)
+	if err != nil {
+		detail := CLIErrorDetail(out)
+		return "", fmt.Errorf("projects api-keys %s: %w%s%s", ref, err, detail, authHint(err.Error()+detail))
+	}
+	return parsePublishableKey(out)
+}
+
+// parsePublishableKey parses the JSON output of `supabase projects api-keys`
+// and returns the publishable key.
+func parsePublishableKey(data []byte) (string, error) {
+	var v struct {
+		Keys []struct {
+			Type   string `json:"type"`
+			APIKey string `json:"api_key"`
+		} `json:"keys"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return "", fmt.Errorf("parse api-keys JSON: %w", err)
+	}
+	for _, k := range v.Keys {
+		if k.Type == "publishable" && k.APIKey != "" {
+			return k.APIKey, nil
+		}
+	}
+	return "", fmt.Errorf("no publishable key in api-keys response")
+}
+
+// apiURL derives the project's API URL from its direct DB host, so no
+// environment's domain is hardcoded: db.<ref>.<domain> → https://<ref>.<domain>.
+func apiURL(dbHost string) string {
+	return "https://" + strings.TrimPrefix(dbHost, "db.")
+}
+
+// listedProject is one entry of `supabase projects list --output-format json`.
+type listedProject struct {
+	Ref              string `json:"ref"`
+	Name             string `json:"name"`
+	Status           string `json:"status"`
+	OrganizationID   string `json:"organization_id"`
+	OrganizationSlug string `json:"organization_slug"`
+	Database         struct {
+		Host string `json:"host"`
+	} `json:"database"`
+}
+
+// parseProjectsList parses the JSON output of `supabase projects list`.
+func parseProjectsList(data []byte) ([]listedProject, error) {
+	var v struct {
+		Projects []listedProject `json:"projects"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return nil, fmt.Errorf("parse projects list JSON: %w", err)
+	}
+	return v.Projects, nil
+}
+
 // projectStatusAndHost parses the JSON output of `supabase projects list` and
 // returns the status and database host for the project with the given ref.
 func projectStatusAndHost(data []byte, ref string) (status, host string, err error) {
-	var v struct {
-		Projects []struct {
-			Ref      string `json:"ref"`
-			Status   string `json:"status"`
-			Database struct {
-				Host string `json:"host"`
-			} `json:"database"`
-		} `json:"projects"`
+	projects, err := parseProjectsList(data)
+	if err != nil {
+		return "", "", err
 	}
-	if err := json.Unmarshal(data, &v); err != nil {
-		return "", "", fmt.Errorf("parse projects list JSON: %w", err)
-	}
-	for _, p := range v.Projects {
+	for _, p := range projects {
 		if p.Ref == ref {
 			return p.Status, p.Database.Host, nil
 		}
@@ -778,18 +1173,11 @@ var errProjectNotListed = errors.New("project not found in projects list")
 // organization_slug; either matching is enough. An empty orgID matches on name
 // alone.
 func projectRefByName(data []byte, name, orgID string) (string, error) {
-	var v struct {
-		Projects []struct {
-			Ref              string `json:"ref"`
-			Name             string `json:"name"`
-			OrganizationID   string `json:"organization_id"`
-			OrganizationSlug string `json:"organization_slug"`
-		} `json:"projects"`
+	projects, err := parseProjectsList(data)
+	if err != nil {
+		return "", err
 	}
-	if err := json.Unmarshal(data, &v); err != nil {
-		return "", fmt.Errorf("parse projects list JSON: %w", err)
-	}
-	for _, p := range v.Projects {
+	for _, p := range projects {
 		if p.Name != name {
 			continue
 		}
@@ -878,9 +1266,9 @@ func poolerHost(dbHost, region string) string {
 // polls GET .../config/disk (defaultDiskResizePollInterval /
 // defaultDiskResizePollTimeout) until the reported attributes actually match
 // what was requested, returning an error if that never happens. Observed
-// live against a staging project where the POST returned 201 but the disk's
+// live where the POST returned 201 but the disk's
 // real attributes never changed.
-func (p *Provider) resizeDiskIfNeeded(ctx context.Context, dbHost, ref string, sizeGB, iops, throughputMibps int, diskType string) error {
+func (p *Provider) resizeDiskIfNeeded(ctx context.Context, profile, dbHost, ref string, sizeGB, iops, throughputMibps int, diskType string) error {
 	if sizeGB == 0 {
 		return nil
 	}
@@ -894,7 +1282,7 @@ func (p *Provider) resizeDiskIfNeeded(ctx context.Context, dbHost, ref string, s
 	if token == "" {
 		return fmt.Errorf("resize disk: no access token (set BENCHCTL_SUPABASE_ACCESS_TOKEN)")
 	}
-	url := "https://" + ManagementAPIHost(dbHost) + "/v1/projects/" + ref + "/config/disk"
+	url := ManagementAPIBase(profile, dbHost) + "/v1/projects/" + ref + "/config/disk"
 
 	current, err := p.getDiskAttrs(ctx, url, token)
 	if err != nil {
@@ -998,26 +1386,55 @@ func (p *Provider) getDiskAttrs(ctx context.Context, url, token string) (diskAtt
 	return diskAttrs{SizeGB: v.Attributes.SizeGB, IOPS: v.Attributes.IOPS, Type: v.Attributes.Type}, nil
 }
 
-// ManagementAPIHost derives the Management API host from the project's direct
-// DB host domain, the same way poolerHost derives the pooler domain. This
-// avoids hardcoding a single (production) host and silently calling the wrong
-// environment's disk API when a scenario targets a non-default --profile.
+// profileAPIBases are the Management APIs of the CLI's built-in profiles. The
+// profile decides which API a project lives behind, and the project's domain
+// can't: projects from different non-production profiles can share a domain.
+var profileAPIBases = map[string]string{
+	"supabase":         "https://api.supabase.com",
+	"supabase-staging": "https://api.supabase.green",
+	"supabase-local":   "http://localhost:8080",
+}
+
+// ManagementAPIBase returns the Management API base URL for a project created
+// with the given CLI profile. For a profile it doesn't know (a YAML profile, or
+// none), it derives the API from the project's direct DB host domain, the same
+// way poolerHost derives the pooler domain, so a non-production project is
+// never silently sent to production:
 //
-// Production: db.abc.supabase.co  → api.supabase.com
-// Staging:    db.abc.supabase.red → api.supabase.green (confirmed live against
-// a staging project during implementation)
-func ManagementAPIHost(dbHost string) string {
+// Production: db.abc.supabase.co  → https://api.supabase.com
+// Other:      db.abc.supabase.red → https://api.supabase.green
+func ManagementAPIBase(profile, dbHost string) string {
+	if base, ok := profileAPIBases[profile]; ok {
+		return base
+	}
 	parts := strings.SplitN(dbHost, ".", 3)
-	directDomain := ""
-	if len(parts) == 3 {
-		directDomain = parts[2]
+	if len(parts) == 3 && parts[2] == "supabase.red" {
+		return profileAPIBases["supabase-staging"]
 	}
-	switch directDomain {
-	case "supabase.red":
-		return "api.supabase.green"
-	default:
-		return "api.supabase.com"
+	return profileAPIBases["supabase"]
+}
+
+// TargetProject is one project a run's outputs describe, with what another
+// package (such as diagnostics) needs to reach its Management API.
+type TargetProject struct {
+	Ref    string
+	DBHost string
+}
+
+// TargetProjects returns every project listed in a run's outputs, in creation
+// order. The DB host comes from the project's api_url_<ref>; runs from before
+// that key existed only recorded host, for their single project.
+func TargetProjects(outputs engine.Outputs) []TargetProject {
+	refs := projectRefs(outputs)
+	projects := make([]TargetProject, len(refs))
+	for i, ref := range refs {
+		host := outputs["host"]
+		if u := outputs[outputKeyAPIURL+ref]; u != "" {
+			host = "db." + strings.TrimPrefix(u, "https://")
+		}
+		projects[i] = TargetProject{Ref: ref, DBHost: host}
 	}
+	return projects
 }
 
 // redactArgs returns args as a single string with --db-password values hidden.

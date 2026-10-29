@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,161 +17,65 @@ import (
 	"github.com/dbarena/benchctl/internal/engine"
 )
 
-// --- parseProjectRef ---
+// --- parseProjectRef and projectStatusAndHost ---
 
 func TestParseProjectRef(t *testing.T) {
 	input := []byte(`{"id":"qwppazzskyahpwdbxlax","ref":"qwppazzskyahpwdbxlax","organization_id":"xjynhifqpbqndckwpead","name":"bench-run-123","region":"us-east-1","status":"UNKNOWN","message":"Created project"}`)
-	ref, err := parseProjectRef(input)
-	if err != nil {
-		t.Fatalf("parseProjectRef: %v", err)
+	if ref, err := parseProjectRef(input); err != nil || ref != "qwppazzskyahpwdbxlax" {
+		t.Errorf("parseProjectRef() = %q, %v; want qwppazzskyahpwdbxlax", ref, err)
 	}
-	if ref != "qwppazzskyahpwdbxlax" {
-		t.Errorf("got %q, want qwppazzskyahpwdbxlax", ref)
-	}
-}
-
-func TestParseProjectRef_MissingRef(t *testing.T) {
-	_, err := parseProjectRef([]byte(`{"status":"UNKNOWN"}`))
-	if err == nil {
-		t.Fatal("expected error for missing ref")
+	if _, err := parseProjectRef([]byte(`{"status":"UNKNOWN"}`)); err == nil {
+		t.Error("expected an error for a missing ref")
 	}
 }
-
-// --- projectStatusAndHost ---
 
 func TestProjectStatusAndHost(t *testing.T) {
 	input := []byte(`{"projects":[{"id":"abc","ref":"abc123","status":"ACTIVE_HEALTHY","database":{"host":"db.abc123.supabase.red","version":"17.0"}}],"message":""}`)
 	status, host, err := projectStatusAndHost(input, "abc123")
-	if err != nil {
-		t.Fatalf("projectStatusAndHost: %v", err)
+	if err != nil || status != "ACTIVE_HEALTHY" || host != "db.abc123.supabase.red" {
+		t.Errorf("projectStatusAndHost() = %q, %q, %v", status, host, err)
 	}
-	if status != "ACTIVE_HEALTHY" {
-		t.Errorf("status: got %q, want ACTIVE_HEALTHY", status)
-	}
-	if host != "db.abc123.supabase.red" {
-		t.Errorf("host: got %q, want db.abc123.supabase.red", host)
-	}
-}
-
-func TestProjectStatusAndHost_NotFound(t *testing.T) {
-	input := []byte(`{"projects":[{"ref":"other","status":"ACTIVE_HEALTHY","database":{"host":"db.other.supabase.co"}}],"message":""}`)
-	_, _, err := projectStatusAndHost(input, "missing")
-	if !errors.Is(err, errProjectNotListed) {
-		t.Fatalf("got %v, want errProjectNotListed", err)
+	if _, _, err := projectStatusAndHost(input, "missing"); !errors.Is(err, errProjectNotListed) {
+		t.Errorf("got %v, want errProjectNotListed", err)
 	}
 }
 
 // --- connectionDetails ---
 
-func TestConnectionDetails_Direct_Production(t *testing.T) {
-	host, port, user := connectionDetails("db.abc123.supabase.co", "abc123", connModeDirect, "us-east-1")
-	if host != "db.abc123.supabase.co" {
-		t.Errorf("host: got %q", host)
-	}
-	if port != "5432" {
-		t.Errorf("port: got %q", port)
-	}
-	if user != "postgres" {
-		t.Errorf("user: got %q", user)
-	}
-}
-
-func TestConnectionDetails_Direct_Staging(t *testing.T) {
-	host, port, user := connectionDetails("db.abc123.supabase.red", "abc123", connModeDirect, "us-east-1")
-	if host != "db.abc123.supabase.red" {
-		t.Errorf("host: got %q", host)
-	}
-	if port != "5432" {
-		t.Errorf("port: got %q", port)
-	}
-	if user != "postgres" {
-		t.Errorf("user: got %q", user)
-	}
-}
-
-func TestConnectionDetails_SupavisorSession(t *testing.T) {
-	host, port, user := connectionDetails("db.abc123.supabase.co", "abc123", connModeSupavisorSession, "us-east-1")
-	if host != "aws-0-us-east-1.pooler.supabase.com" {
-		t.Errorf("host: got %q, want aws-0-us-east-1.pooler.supabase.com", host)
-	}
-	if port != "5432" {
-		t.Errorf("port: got %q", port)
-	}
-	if user != "postgres.abc123" {
-		t.Errorf("user: got %q, want postgres.abc123", user)
-	}
-}
-
-func TestConnectionDetails_SupavisorSession_Staging(t *testing.T) {
-	host, port, user := connectionDetails("db.abc123.supabase.red", "abc123", connModeSupavisorSession, "us-east-1")
-	if host != "aws-0-us-east-1.pooler.supabase.green" {
-		t.Errorf("host: got %q, want aws-0-us-east-1.pooler.supabase.green", host)
-	}
-	if port != "5432" {
-		t.Errorf("port: got %q", port)
-	}
-	if user != "postgres.abc123" {
-		t.Errorf("user: got %q, want postgres.abc123", user)
-	}
-}
-
-func TestConnectionDetails_SupavisorTransaction(t *testing.T) {
-	host, port, user := connectionDetails("db.abc123.supabase.co", "abc123", connModeSupavisorTransaction, "eu-central-1")
-	if host != "aws-0-eu-central-1.pooler.supabase.com" {
-		t.Errorf("host: got %q", host)
-	}
-	if port != "6543" {
-		t.Errorf("port: got %q, want 6543", port)
-	}
-	if user != "postgres.abc123" {
-		t.Errorf("user: got %q", user)
-	}
-}
-
-// --- usesPooler ---
-
-func TestUsesPooler(t *testing.T) {
-	cases := []struct {
-		mode string
-		want bool
+func TestConnectionDetails(t *testing.T) {
+	for _, tc := range []struct {
+		name, dbHost, mode, region, wantHost, wantPort, wantUser string
 	}{
-		{connModeDirect, false},
-		{connModeSupavisorSession, true},
-		{connModeSupavisorTransaction, true},
+		{"direct production", "db.abc123.supabase.co", connModeDirect, "us-east-1", "db.abc123.supabase.co", "5432", "postgres"},
+		{"direct staging", "db.abc123.supabase.red", connModeDirect, "us-east-1", "db.abc123.supabase.red", "5432", "postgres"},
+		{"session production", "db.abc123.supabase.co", connModeSupavisorSession, "us-east-1", "aws-0-us-east-1.pooler.supabase.com", "5432", "postgres.abc123"},
+		{"session staging", "db.abc123.supabase.red", connModeSupavisorSession, "us-east-1", "aws-0-us-east-1.pooler.supabase.green", "5432", "postgres.abc123"},
+		{"transaction", "db.abc123.supabase.co", connModeSupavisorTransaction, "eu-central-1", "aws-0-eu-central-1.pooler.supabase.com", "6543", "postgres.abc123"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			host, port, user := connectionDetails(tc.dbHost, "abc123", tc.mode, tc.region)
+			if host != tc.wantHost || port != tc.wantPort || user != tc.wantUser {
+				t.Errorf("connectionDetails() = %q, %q, %q; want %q, %q, %q", host, port, user, tc.wantHost, tc.wantPort, tc.wantUser)
+			}
+		})
 	}
-	for _, c := range cases {
-		if got := usesPooler(c.mode); got != c.want {
-			t.Errorf("usesPooler(%q) = %v, want %v", c.mode, got, c.want)
+}
+
+// --- globalArgs and redactArgs ---
+
+func TestGlobalArgs(t *testing.T) {
+	for _, tc := range []struct {
+		profile string
+		workDir []string
+		want    []string
+	}{
+		{"", []string{"/tmp/work"}, []string{"--workdir", "/tmp/work"}},
+		{"supabase-staging", []string{"/tmp/work"}, []string{"--profile", "supabase-staging", "--workdir", "/tmp/work"}},
+		{"supabase-staging", nil, []string{"--profile", "supabase-staging"}},
+	} {
+		if got := globalArgs(tc.profile, tc.workDir...); !slices.Equal(got, tc.want) {
+			t.Errorf("globalArgs(%q, %v) = %v, want %v", tc.profile, tc.workDir, got, tc.want)
 		}
-	}
-}
-
-// --- globalArgs ---
-
-func TestBuildCreateArgs_Plain(t *testing.T) {
-	args := globalArgs("", "/tmp/work")
-	if len(args) != 2 {
-		t.Errorf("expected 2 args (--workdir only), got %v", args)
-	}
-	if args[0] != "--workdir" {
-		t.Errorf("expected --workdir, got %q", args[0])
-	}
-}
-
-func TestBuildCreateArgs_WithProfile(t *testing.T) {
-	args := globalArgs("supabase-staging", "/tmp/work")
-	if args[0] != "--profile" || args[1] != "supabase-staging" {
-		t.Errorf("expected --profile supabase-staging, got %v", args)
-	}
-	if args[2] != "--workdir" {
-		t.Errorf("expected --workdir, got %v", args)
-	}
-}
-
-func TestBuildCreateArgs_ProfileOnly(t *testing.T) {
-	args := globalArgs("supabase-staging")
-	if len(args) != 2 || args[0] != "--profile" || args[1] != "supabase-staging" {
-		t.Errorf("expected [--profile supabase-staging], got %v", args)
 	}
 }
 
@@ -188,208 +94,109 @@ func TestPasswordNotInArgs(t *testing.T) {
 
 // --- parseConfig ---
 
-func TestParseConfig_MissingRegion(t *testing.T) {
-	_, err := parseConfig(map[string]any{"org_id": "x", "project_size": "pico", "connection_mode": "direct"})
-	if err == nil || !strings.Contains(err.Error(), "region") {
-		t.Errorf("expected region error, got %v", err)
+func TestParseConfig(t *testing.T) {
+	// with is a minimal valid config; a nil value removes the key.
+	with := func(kv ...any) map[string]any {
+		cfg := map[string]any{"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct"}
+		for i := 0; i < len(kv); i += 2 {
+			if kv[i+1] == nil {
+				delete(cfg, kv[i].(string))
+			} else {
+				cfg[kv[i].(string)] = kv[i+1]
+			}
+		}
+		return cfg
 	}
-}
 
-func TestParseConfig_InvalidConnectionMode(t *testing.T) {
-	_, err := parseConfig(map[string]any{
-		"region":          "us-east-1",
-		"org_id":          "x",
-		"project_size":    "pico",
-		"connection_mode": "invalid",
+	t.Run("valid", func(t *testing.T) {
+		c, err := parseConfig(with(
+			"org_id", "myorg", "connection_mode", "supavisor-session", "high_availability", true, "experimental", true,
+			"release_channel", "internal", "postgres_engine", "17-acme", "profile", "supabase-staging",
+		))
+		if err != nil {
+			t.Fatalf("parseConfig: %v", err)
+		}
+		if c.Region != "us-east-1" || c.OrgID != "myorg" || !c.HighAvailability || !c.Experimental ||
+			c.ReleaseChannel != "internal" || c.PostgresEngine != "17-acme" || c.Profile != "supabase-staging" {
+			t.Errorf("unexpected config: %+v", c)
+		}
 	})
-	if err == nil || !strings.Contains(err.Error(), "invalid") {
-		t.Errorf("expected connection_mode error, got %v", err)
-	}
-}
 
-func TestParseConfig_Valid(t *testing.T) {
-	c, err := parseConfig(map[string]any{
-		"region":            "us-east-1",
-		"org_id":            "myorg",
-		"project_size":      "pico",
-		"connection_mode":   "supavisor-session",
-		"high_availability": true,
-		"experimental":      true,
-		"release_channel":   "internal",
-		"postgres_engine":   "17-acme",
-		"profile":           "supabase-staging",
+	t.Run("disk keys default to unset and gp3, and accept strings", func(t *testing.T) {
+		c, err := parseConfig(with())
+		if err != nil || c.DiskSizeGB != 0 || c.DiskIOPS != 0 || c.DiskThroughputMibps != 0 || c.DiskType != diskTypeGP3 {
+			t.Errorf("defaults: %+v, %v", c, err)
+		}
+		c, err = parseConfig(with("disk_size_gb", "16", "disk_iops", "6000", "disk_throughput_mibps", "125", "disk_type", "io2"))
+		if err != nil || c.DiskSizeGB != 16 || c.DiskIOPS != 6000 || c.DiskThroughputMibps != 125 || c.DiskType != diskTypeIO2 {
+			t.Errorf("values: %+v, %v", c, err)
+		}
 	})
-	if err != nil {
-		t.Fatalf("parseConfig: %v", err)
-	}
-	if c.Region != "us-east-1" || c.OrgID != "myorg" || !c.HighAvailability || !c.Experimental ||
-		c.ReleaseChannel != "internal" || c.PostgresEngine != "17-acme" || c.Profile != "supabase-staging" {
-		t.Errorf("unexpected config: %+v", c)
+
+	for _, tc := range []struct {
+		name string
+		cfg  map[string]any
+		want string
+	}{
+		{"missing region", with("region", nil), "region"},
+		{"invalid connection mode", with("connection_mode", "invalid"), "invalid"},
+		{"invalid disk_size_gb", with("disk_size_gb", "not-a-number"), "disk_size_gb"},
+		{"invalid disk_iops", with("disk_iops", "not-a-number"), "disk_iops"},
+		{"invalid disk_throughput_mibps", with("disk_throughput_mibps", "not-a-number"), "disk_throughput_mibps"},
+		{"invalid disk_type", with("disk_type", "io1"), "disk_type"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseConfig(tc.cfg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("got %v, want an error naming %q", err, tc.want)
+			}
+		})
 	}
 }
 
-// --- parseConfig: disk_size_gb ---
+// --- ManagementAPIBase ---
 
-func TestParseConfig_DiskSizeGB_Absent(t *testing.T) {
-	c, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
+func TestManagementAPIBase(t *testing.T) {
+	for _, tc := range []struct{ profile, dbHost, want string }{
+		{"", "db.abc123.supabase.co", "https://api.supabase.com"},
+		{"", "db.abc123.supabase.red", "https://api.supabase.green"},
+		{"", "db.abc123.example.net", "https://api.supabase.com"},
+		// The profile wins: different profiles can share a domain.
+		{"supabase-local", "db.abc123.supabase.red", "http://localhost:8080"},
+		{"supabase-staging", "db.abc123.supabase.red", "https://api.supabase.green"},
+		{"/path/to/profile.yaml", "db.abc123.supabase.red", "https://api.supabase.green"},
+	} {
+		if got := ManagementAPIBase(tc.profile, tc.dbHost); got != tc.want {
+			t.Errorf("ManagementAPIBase(%q, %q) = %q, want %q", tc.profile, tc.dbHost, got, tc.want)
+		}
+	}
+}
+
+func TestTargetProjects(t *testing.T) {
+	t.Run("several projects", func(t *testing.T) {
+		got := TargetProjects(engine.Outputs{
+			outputKeyProjectRefs:          "a,b",
+			outputKeyAPIURL + "a":         "https://a.supabase.red",
+			outputKeyAPIURL + "b":         "https://b.supabase.red",
+			outputKeyPublishableKey + "a": "pub-a",
+		})
+		want := []TargetProject{{Ref: "a", DBHost: "db.a.supabase.red"}, {Ref: "b", DBHost: "db.b.supabase.red"}}
+		if !slices.Equal(got, want) {
+			t.Errorf("TargetProjects() = %v, want %v", got, want)
+		}
 	})
-	if err != nil {
-		t.Fatalf("parseConfig: %v", err)
-	}
-	if c.DiskSizeGB != 0 {
-		t.Errorf("DiskSizeGB: got %d, want 0", c.DiskSizeGB)
-	}
-}
 
-func TestParseConfig_DiskSizeGB_StringValue(t *testing.T) {
-	c, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
-		"disk_size_gb": "16",
+	t.Run("single project from before api_url", func(t *testing.T) {
+		got := TargetProjects(engine.Outputs{outputKeyProjectRef: "a", "host": "db.a.supabase.co"})
+		if want := []TargetProject{{Ref: "a", DBHost: "db.a.supabase.co"}}; !slices.Equal(got, want) {
+			t.Errorf("TargetProjects() = %v, want %v", got, want)
+		}
 	})
-	if err != nil {
-		t.Fatalf("parseConfig: %v", err)
-	}
-	if c.DiskSizeGB != 16 {
-		t.Errorf("DiskSizeGB: got %d, want 16", c.DiskSizeGB)
-	}
-}
 
-func TestParseConfig_DiskSizeGB_Invalid(t *testing.T) {
-	_, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
-		"disk_size_gb": "not-a-number",
+	t.Run("no projects", func(t *testing.T) {
+		if got := TargetProjects(engine.Outputs{}); len(got) != 0 {
+			t.Errorf("TargetProjects() = %v, want none", got)
+		}
 	})
-	if err == nil || !strings.Contains(err.Error(), "disk_size_gb") {
-		t.Errorf("expected disk_size_gb error, got %v", err)
-	}
-}
-
-func TestParseConfig_DiskIOPS_Absent(t *testing.T) {
-	c, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
-	})
-	if err != nil {
-		t.Fatalf("parseConfig: %v", err)
-	}
-	if c.DiskIOPS != 0 {
-		t.Errorf("DiskIOPS: got %d, want 0", c.DiskIOPS)
-	}
-}
-
-func TestParseConfig_DiskIOPS_StringValue(t *testing.T) {
-	c, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
-		"disk_iops": "6000",
-	})
-	if err != nil {
-		t.Fatalf("parseConfig: %v", err)
-	}
-	if c.DiskIOPS != 6000 {
-		t.Errorf("DiskIOPS: got %d, want 6000", c.DiskIOPS)
-	}
-}
-
-func TestParseConfig_DiskIOPS_Invalid(t *testing.T) {
-	_, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
-		"disk_iops": "not-a-number",
-	})
-	if err == nil || !strings.Contains(err.Error(), "disk_iops") {
-		t.Errorf("expected disk_iops error, got %v", err)
-	}
-}
-
-func TestParseConfig_DiskThroughputMibps_Absent(t *testing.T) {
-	c, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
-	})
-	if err != nil {
-		t.Fatalf("parseConfig: %v", err)
-	}
-	if c.DiskThroughputMibps != 0 {
-		t.Errorf("DiskThroughputMibps: got %d, want 0", c.DiskThroughputMibps)
-	}
-}
-
-func TestParseConfig_DiskThroughputMibps_StringValue(t *testing.T) {
-	c, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
-		"disk_throughput_mibps": "125",
-	})
-	if err != nil {
-		t.Fatalf("parseConfig: %v", err)
-	}
-	if c.DiskThroughputMibps != 125 {
-		t.Errorf("DiskThroughputMibps: got %d, want 125", c.DiskThroughputMibps)
-	}
-}
-
-func TestParseConfig_DiskThroughputMibps_Invalid(t *testing.T) {
-	_, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
-		"disk_throughput_mibps": "not-a-number",
-	})
-	if err == nil || !strings.Contains(err.Error(), "disk_throughput_mibps") {
-		t.Errorf("expected disk_throughput_mibps error, got %v", err)
-	}
-}
-
-// --- parseConfig: disk_type ---
-
-func TestParseConfig_DiskType_DefaultsToGP3(t *testing.T) {
-	c, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
-	})
-	if err != nil {
-		t.Fatalf("parseConfig: %v", err)
-	}
-	if c.DiskType != diskTypeGP3 {
-		t.Errorf("DiskType: got %q, want %q", c.DiskType, diskTypeGP3)
-	}
-}
-
-func TestParseConfig_DiskType_IO2(t *testing.T) {
-	c, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
-		"disk_type": "io2",
-	})
-	if err != nil {
-		t.Fatalf("parseConfig: %v", err)
-	}
-	if c.DiskType != diskTypeIO2 {
-		t.Errorf("DiskType: got %q, want %q", c.DiskType, diskTypeIO2)
-	}
-}
-
-func TestParseConfig_DiskType_Invalid(t *testing.T) {
-	_, err := parseConfig(map[string]any{
-		"region": "us-east-1", "org_id": "x", "project_size": "pico", "connection_mode": "direct",
-		"disk_type": "io1",
-	})
-	if err == nil || !strings.Contains(err.Error(), "disk_type") {
-		t.Errorf("expected disk_type error, got %v", err)
-	}
-}
-
-// --- ManagementAPIHost ---
-
-func TestManagementAPIHost_Production(t *testing.T) {
-	if got := ManagementAPIHost("db.abc123.supabase.co"); got != "api.supabase.com" {
-		t.Errorf("got %q, want api.supabase.com", got)
-	}
-}
-
-func TestManagementAPIHost_Staging(t *testing.T) {
-	if got := ManagementAPIHost("db.abc123.supabase.red"); got != "api.supabase.green" {
-		t.Errorf("got %q, want api.supabase.green", got)
-	}
-}
-
-func TestManagementAPIHost_UnknownDomainFallsBackToProduction(t *testing.T) {
-	if got := ManagementAPIHost("db.abc123.example.net"); got != "api.supabase.com" {
-		t.Errorf("got %q, want api.supabase.com (fallback)", got)
-	}
 }
 
 // --- resizeDiskIfNeeded ---
@@ -430,20 +237,11 @@ func TestResizeDiskIfNeeded_SkipWhenZero(t *testing.T) {
 	// before any HTTP call (including the token check).
 	fake := &fakeDoer{}
 	p := &Provider{out: io.Discard, doer: fake}
-	if err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 0, 0, 0, ""); err != nil {
+	if err := p.resizeDiskIfNeeded(context.Background(), "", "db.abc.supabase.co", "abc", 0, 0, 0, ""); err != nil {
 		t.Fatalf("expected no-op, got error: %v", err)
 	}
 	if len(fake.calls) != 0 {
 		t.Errorf("expected no HTTP calls, got %d", len(fake.calls))
-	}
-}
-
-func TestResizeDiskIfNeeded_NoToken(t *testing.T) {
-	fake := &fakeDoer{}
-	p := &Provider{out: io.Discard, doer: fake, cfg: &config.Config{}}
-	err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 16, 0, 0, "")
-	if err == nil || !strings.Contains(err.Error(), "access token") {
-		t.Errorf("expected access token error, got %v", err)
 	}
 }
 
@@ -452,7 +250,7 @@ func TestResizeDiskIfNeeded_SkipWhenAlreadyBigEnough(t *testing.T) {
 		{status: 200, body: `{"attributes":{"size_gb":32,"iops":3000,"type":"gp3","throughput_mibps":125}}`},
 	}}
 	p := &Provider{out: io.Discard, doer: fake, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
-	if err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 16, 0, 0, ""); err != nil {
+	if err := p.resizeDiskIfNeeded(context.Background(), "", "db.abc.supabase.co", "abc", 16, 0, 0, ""); err != nil {
 		t.Fatalf("expected no-op, got error: %v", err)
 	}
 	if len(fake.calls) != 1 {
@@ -463,90 +261,72 @@ func TestResizeDiskIfNeeded_SkipWhenAlreadyBigEnough(t *testing.T) {
 	}
 }
 
-func TestResizeDiskIfNeeded_PostsExpectedBodyAndURL(t *testing.T) {
-	fake := &fakeDoer{responses: []fakeResponse{
-		{status: 200, body: `{"attributes":{"size_gb":8,"iops":3000,"type":"gp3","throughput_mibps":125}}`},
-		{status: 201, body: ``},
-		{status: 200, body: `{"attributes":{"size_gb":16,"iops":3000,"type":"gp3","throughput_mibps":125}}`},
-	}}
-	p := &Provider{out: io.Discard, doer: fake, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
-	if err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 16, 0, 0, ""); err != nil {
-		t.Fatalf("resizeDiskIfNeeded: %v", err)
-	}
-	if len(fake.calls) != 3 {
-		t.Fatalf("expected 3 calls (GET, POST, confirmation GET), got %d", len(fake.calls))
-	}
-	get, post := fake.calls[0], fake.calls[1]
-	wantURL := "https://api.supabase.com/v1/projects/abc/config/disk"
-	if get.URL.String() != wantURL || get.Method != http.MethodGet {
-		t.Errorf("GET: got %s %s, want GET %s", get.Method, get.URL, wantURL)
-	}
-	if post.URL.String() != wantURL || post.Method != http.MethodPost {
-		t.Errorf("POST: got %s %s, want POST %s", post.Method, post.URL, wantURL)
-	}
-	if got := post.Header.Get("Authorization"); got != "Bearer test-token" {
-		t.Errorf("Authorization header: got %q", got)
-	}
-	body, _ := io.ReadAll(post.Body)
-	wantBody := `{"attributes":{"type":"gp3","size_gb":16,"iops":3000}}`
-	if string(body) != wantBody {
-		t.Errorf("POST body: got %s, want %s", body, wantBody)
-	}
-}
-
-func TestResizeDiskIfNeeded_CustomIOPSNotHardOverridden(t *testing.T) {
-	// Guards against silently pinning every tier to 3000 IOPS: XL's
-	// documented baseline (6000, per compute-and-disk docs) must reach the
-	// POST body unchanged, not get clamped/overridden.
-	fake := &fakeDoer{responses: []fakeResponse{
-		{status: 200, body: `{"attributes":{"size_gb":8,"iops":3000,"type":"gp3","throughput_mibps":125}}`},
-		{status: 201, body: ``},
-		{status: 200, body: `{"attributes":{"size_gb":128,"iops":6000,"type":"gp3","throughput_mibps":125}}`},
-	}}
-	p := &Provider{out: io.Discard, doer: fake, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
-	if err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 128, 6000, 0, ""); err != nil {
-		t.Fatalf("resizeDiskIfNeeded: %v", err)
-	}
-	body, _ := io.ReadAll(fake.calls[1].Body)
-	wantBody := `{"attributes":{"type":"gp3","size_gb":128,"iops":6000}}`
-	if string(body) != wantBody {
-		t.Errorf("POST body: got %s, want %s", body, wantBody)
+// A POST body carries what the config asks for: the IOPS the caller chose
+// reach the API unchanged, and io2 never gets a throughput.
+func TestResizeDiskIfNeeded_PostBody(t *testing.T) {
+	const current = `{"attributes":{"size_gb":8,"iops":3000,"type":"gp3","throughput_mibps":125}}`
+	for _, tc := range []struct {
+		name                     string
+		sizeGB, iops, throughput int
+		diskType                 string
+		resized, wantBody        string
+	}{
+		{"defaults", 16, 0, 0, "", `{"attributes":{"size_gb":16,"iops":3000,"type":"gp3","throughput_mibps":125}}`,
+			`{"attributes":{"type":"gp3","size_gb":16,"iops":3000}}`},
+		{"custom iops are not overridden", 128, 6000, 0, "", `{"attributes":{"size_gb":128,"iops":6000,"type":"gp3","throughput_mibps":125}}`,
+			`{"attributes":{"type":"gp3","size_gb":128,"iops":6000}}`},
+		{"throughput when set", 16, 0, 125, "", `{"attributes":{"size_gb":16,"iops":3000,"type":"gp3","throughput_mibps":125}}`,
+			`{"attributes":{"type":"gp3","size_gb":16,"iops":3000,"throughput_mibps":125}}`},
+		{"io2 omits throughput", 512, 20000, 125, "io2", `{"attributes":{"size_gb":512,"iops":20000,"type":"io2"}}`,
+			`{"attributes":{"type":"io2","size_gb":512,"iops":20000}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeDoer{responses: []fakeResponse{{status: 200, body: current}, {status: 201}, {status: 200, body: tc.resized}}}
+			p := &Provider{out: io.Discard, doer: fake, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
+			if err := p.resizeDiskIfNeeded(context.Background(), "", "db.abc.supabase.co", "abc", tc.sizeGB, tc.iops, tc.throughput, tc.diskType); err != nil {
+				t.Fatalf("resizeDiskIfNeeded: %v", err)
+			}
+			if len(fake.calls) != 3 {
+				t.Fatalf("expected 3 calls (GET, POST, confirmation GET), got %d", len(fake.calls))
+			}
+			post := fake.calls[1]
+			wantURL := "https://api.supabase.com/v1/projects/abc/config/disk"
+			if post.URL.String() != wantURL || post.Method != http.MethodPost || post.Header.Get("Authorization") != "Bearer test-token" {
+				t.Errorf("POST: got %s %s (auth %q), want POST %s with the token", post.Method, post.URL, post.Header.Get("Authorization"), wantURL)
+			}
+			if body, _ := io.ReadAll(post.Body); string(body) != tc.wantBody {
+				t.Errorf("POST body: got %s, want %s", body, tc.wantBody)
+			}
+		})
 	}
 }
 
-func TestResizeDiskIfNeeded_IncludesThroughputWhenSet(t *testing.T) {
-	fake := &fakeDoer{responses: []fakeResponse{
-		{status: 200, body: `{"attributes":{"size_gb":8,"iops":3000,"type":"gp3","throughput_mibps":125}}`},
-		{status: 201, body: ``},
-		{status: 200, body: `{"attributes":{"size_gb":16,"iops":3000,"type":"gp3","throughput_mibps":125}}`},
-	}}
-	p := &Provider{out: io.Discard, doer: fake, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
-	if err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 16, 0, 125, ""); err != nil {
-		t.Fatalf("resizeDiskIfNeeded: %v", err)
-	}
-	body, _ := io.ReadAll(fake.calls[1].Body)
-	wantBody := `{"attributes":{"type":"gp3","size_gb":16,"iops":3000,"throughput_mibps":125}}`
-	if string(body) != wantBody {
-		t.Errorf("POST body: got %s, want %s", body, wantBody)
-	}
-}
-
-func TestResizeDiskIfNeeded_IO2OmitsThroughputAndSetsType(t *testing.T) {
-	// io2 doesn't accept a throughput_mibps attribute; a caller passing one
-	// (e.g. a leftover gp3-era config value) must not have it forwarded.
-	fake := &fakeDoer{responses: []fakeResponse{
-		{status: 200, body: `{"attributes":{"size_gb":8,"iops":3000,"type":"gp3"}}`},
-		{status: 201, body: ``},
-		{status: 200, body: `{"attributes":{"size_gb":512,"iops":20000,"type":"io2"}}`},
-	}}
-	p := &Provider{out: io.Discard, doer: fake, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
-	if err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 512, 20000, 125, "io2"); err != nil {
-		t.Fatalf("resizeDiskIfNeeded: %v", err)
-	}
-	body, _ := io.ReadAll(fake.calls[1].Body)
-	wantBody := `{"attributes":{"type":"io2","size_gb":512,"iops":20000}}`
-	if string(body) != wantBody {
-		t.Errorf("POST body: got %s, want %s", body, wantBody)
+// A resize is done only once the disk's real attributes match. The incident
+// behind this: the POST returned success, but the volume stayed at its old
+// size and type, and benchctl ran against an undersized disk.
+func TestResizeDiskIfNeeded_NotConfirmed(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		iops           int
+		diskType       string
+		afterPostAttrs string
+	}{
+		{"never converges", 0, "", `{"attributes":{"size_gb":8,"iops":3000,"type":"gp3","throughput_mibps":125}}`},
+		// Size matches but the type is still gp3, not the requested io2.
+		{"type mismatch", 20000, "io2", `{"attributes":{"size_gb":16,"iops":3000,"type":"gp3"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeDoer{responses: []fakeResponse{
+				{status: 200, body: `{"attributes":{"size_gb":8,"iops":3000,"type":"gp3"}}`},
+				{status: 201},
+				{status: 200, body: tc.afterPostAttrs},
+			}}
+			p := &Provider{out: io.Discard, doer: fake, diskResizePollTimeout: time.Nanosecond, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
+			err := p.resizeDiskIfNeeded(context.Background(), "", "db.abc.supabase.co", "abc", 16, tc.iops, 0, tc.diskType)
+			if err == nil || !strings.Contains(err.Error(), "timed out waiting for") {
+				t.Errorf("expected a timeout error, got %v", err)
+			}
+		})
 	}
 }
 
@@ -556,20 +336,9 @@ func TestResizeDiskIfNeeded_ErrorOnNon2xxPostResponse(t *testing.T) {
 		{status: 429, body: `{"message":"Database disk can only be modified once per four hours."}`},
 	}}
 	p := &Provider{out: io.Discard, doer: fake, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
-	err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 16, 0, 0, "")
+	err := p.resizeDiskIfNeeded(context.Background(), "", "db.abc.supabase.co", "abc", 16, 0, 0, "")
 	if err == nil || !strings.Contains(err.Error(), "429") {
 		t.Errorf("expected HTTP 429 error, got %v", err)
-	}
-}
-
-func TestResizeDiskIfNeeded_ErrorOnGetFailure(t *testing.T) {
-	fake := &fakeDoer{responses: []fakeResponse{
-		{status: 401, body: `{"message":"Unauthorized"}`},
-	}}
-	p := &Provider{out: io.Discard, doer: fake, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
-	err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 16, 0, 0, "")
-	if err == nil || !strings.Contains(err.Error(), "get current size") {
-		t.Errorf("expected get-current-size error, got %v", err)
 	}
 }
 
@@ -587,7 +356,7 @@ func TestResizeDiskIfNeeded_PollsUntilResizeConfirmed(t *testing.T) {
 		{status: 200, body: `{"attributes":{"size_gb":16,"iops":3000,"type":"gp3","throughput_mibps":125}}`},
 	}}
 	p := &Provider{out: io.Discard, doer: fake, diskResizePollInterval: time.Millisecond, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
-	if err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 16, 0, 0, ""); err != nil {
+	if err := p.resizeDiskIfNeeded(context.Background(), "", "db.abc.supabase.co", "abc", 16, 0, 0, ""); err != nil {
 		t.Fatalf("resizeDiskIfNeeded: %v", err)
 	}
 	if len(fake.calls) != 4 {
@@ -595,114 +364,51 @@ func TestResizeDiskIfNeeded_PollsUntilResizeConfirmed(t *testing.T) {
 	}
 }
 
-// TestResizeDiskIfNeeded_TimesOutIfNeverConfirmed is the regression test for
-// the incident that motivated this verification: the POST returned success,
-// but the disk's real attributes never changed. Without polling, benchctl
-// would have reported the resize as done and continued into a benchmark run
-// against an unresized, undersized disk.
-func TestResizeDiskIfNeeded_TimesOutIfNeverConfirmed(t *testing.T) {
-	fake := &fakeDoer{responses: []fakeResponse{
-		{status: 200, body: `{"attributes":{"size_gb":8,"iops":3000,"type":"gp3","throughput_mibps":125}}`},
-		{status: 201, body: ``},
-		// Never converges; matches the incident, where the volume stayed at
-		// its pre-resize size/type/IOPS indefinitely despite the 201.
-		{status: 200, body: `{"attributes":{"size_gb":8,"iops":3000,"type":"gp3","throughput_mibps":125}}`},
-	}}
-	p := &Provider{out: io.Discard, doer: fake, diskResizePollTimeout: time.Nanosecond, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
-	err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 16, 0, 0, "")
-	if err == nil || !strings.Contains(err.Error(), "timed out waiting for") {
-		t.Errorf("expected a timeout error, got %v", err)
+// --- alreadyDeleted, CLIErrorDetail and RunMetadata ---
+
+func TestAlreadyDeleted(t *testing.T) {
+	for _, tc := range []struct {
+		stderr string
+		want   bool
+	}{
+		{`Failed to delete project qragommjtanxcypltlcr: {"message":"Resource has been removed"}` + "\n", true},
+		{`Failed to delete project abc: {"message":"Unauthorized"}` + "\n", false},
+	} {
+		if got := alreadyDeleted([]byte(tc.stderr)); got != tc.want {
+			t.Errorf("alreadyDeleted(%q) = %v, want %v", tc.stderr, got, tc.want)
+		}
 	}
 }
 
-// TestResizeDiskIfNeeded_TypeMismatchNotConfirmed guards specifically against
-// the incident's gp3-instead-of-io2 symptom: size alone reaching the target
-// must not be enough when type/IOPS haven't also converged.
-func TestResizeDiskIfNeeded_TypeMismatchNotConfirmed(t *testing.T) {
-	fake := &fakeDoer{responses: []fakeResponse{
-		{status: 200, body: `{"attributes":{"size_gb":8,"iops":3000,"type":"gp3"}}`},
-		{status: 201, body: ``},
-		// Size matches but type is still gp3, not the requested io2.
-		{status: 200, body: `{"attributes":{"size_gb":16,"iops":3000,"type":"gp3"}}`},
-	}}
-	p := &Provider{out: io.Discard, doer: fake, diskResizePollTimeout: time.Nanosecond, cfg: &config.Config{Supabase: config.SupabaseConfig{AccessToken: "test-token"}}}
-	err := p.resizeDiskIfNeeded(context.Background(), "db.abc.supabase.co", "abc", 16, 20000, 0, "io2")
-	if err == nil || !strings.Contains(err.Error(), "timed out waiting for") {
-		t.Errorf("expected a timeout error, got %v", err)
+func TestCLIErrorDetail(t *testing.T) {
+	for _, tc := range []struct{ name, stdout, want string }{
+		{"json error", `{"_tag":"Error","error":{"code":"LegacyInvalidAccessTokenError","message":"Invalid access token format. Must be like ` + "`sbp_0102...1920`" + `."}}`,
+			": Invalid access token format. Must be like `sbp_0102...1920`. (LegacyInvalidAccessTokenError)"},
+		{"no code", `{"_tag":"Error","error":{"message":"something went wrong"}}`, ": something went wrong"},
+		{"plain text", "some human-readable CLI output\n", ""},
+		{"empty", "", ""},
+	} {
+		if got := CLIErrorDetail([]byte(tc.stdout)); got != tc.want {
+			t.Errorf("%s: CLIErrorDetail() = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
 
-// --- TeardownMissingProjectRef ---
-
-func TestTeardownMissingProjectRef(t *testing.T) {
+func TestRunMetadata(t *testing.T) {
 	p := New(&config.Config{})
-	err := p.Teardown(context.Background(), engine.Outputs{})
-	if err == nil || !strings.Contains(err.Error(), outputKeyProjectRef) {
-		t.Errorf("expected missing project_ref error, got %v", err)
+	for _, tc := range []struct {
+		outputs engine.Outputs
+		want    string
+	}{
+		{engine.Outputs{outputKeyProjectRef: "abcxyz"}, "abcxyz"},
+		{engine.Outputs{outputKeyProjectRefs: "aaa,bbb"}, "aaa,bbb"},
+	} {
+		if got := p.RunMetadata(tc.outputs); got["project_id"] != tc.want {
+			t.Errorf("RunMetadata(%v)[project_id] = %v, want %s", tc.outputs, got["project_id"], tc.want)
+		}
 	}
-}
-
-// --- alreadyDeleted ---
-
-func TestAlreadyDeleted_MatchesResourceRemoved(t *testing.T) {
-	stderr := []byte(`Failed to delete project qragommjtanxcypltlcr: {"message":"Resource has been removed"}` + "\n")
-	if !alreadyDeleted(stderr) {
-		t.Error("expected alreadyDeleted to match a 'Resource has been removed' response")
-	}
-}
-
-func TestAlreadyDeleted_UnrelatedError(t *testing.T) {
-	stderr := []byte(`Failed to delete project abc: {"message":"Unauthorized"}` + "\n")
-	if alreadyDeleted(stderr) {
-		t.Error("expected alreadyDeleted to not match an unrelated error")
-	}
-}
-
-// --- cliErrorDetail ---
-
-func TestCliErrorDetail_ParsesJSONError(t *testing.T) {
-	stdout := []byte(`{"_tag":"Error","error":{"code":"LegacyInvalidAccessTokenError","message":"Invalid access token format. Must be like ` + "`sbp_0102...1920`" + `."}}`)
-	got := cliErrorDetail(stdout)
-	want := ": Invalid access token format. Must be like `sbp_0102...1920`. (LegacyInvalidAccessTokenError)"
-	if got != want {
-		t.Errorf("cliErrorDetail() = %q, want %q", got, want)
-	}
-}
-
-func TestCliErrorDetail_OmitsCodeWhenAbsent(t *testing.T) {
-	stdout := []byte(`{"_tag":"Error","error":{"message":"something went wrong"}}`)
-	if got, want := cliErrorDetail(stdout), ": something went wrong"; got != want {
-		t.Errorf("cliErrorDetail() = %q, want %q", got, want)
-	}
-}
-
-func TestCliErrorDetail_EmptyOnPlainText(t *testing.T) {
-	if got := cliErrorDetail([]byte("some human-readable CLI output\n")); got != "" {
-		t.Errorf("cliErrorDetail() = %q, want empty string", got)
-	}
-}
-
-func TestCliErrorDetail_EmptyOnEmptyStdout(t *testing.T) {
-	if got := cliErrorDetail(nil); got != "" {
-		t.Errorf("cliErrorDetail() = %q, want empty string", got)
-	}
-}
-
-// --- RunMetadata ---
-
-func TestRunMetadata_ReturnsProjectID(t *testing.T) {
-	p := New(&config.Config{})
-	got := p.RunMetadata(engine.Outputs{outputKeyProjectRef: "abcxyz"})
-	if got["project_id"] != "abcxyz" {
-		t.Errorf("RunMetadata()[project_id] = %v, want abcxyz", got["project_id"])
-	}
-}
-
-func TestRunMetadata_NilWhenProjectRefAbsent(t *testing.T) {
-	p := New(&config.Config{})
-	got := p.RunMetadata(engine.Outputs{})
-	if got != nil {
-		t.Errorf("RunMetadata() = %v, want nil", got)
+	if got := p.RunMetadata(engine.Outputs{}); got != nil {
+		t.Errorf("RunMetadata() = %v, want nil without a project ref", got)
 	}
 }
 
@@ -793,6 +499,31 @@ func TestProvision_WaitForProjectTimeout_SelfCleanupSucceeds(t *testing.T) {
 	}
 }
 
+func TestProvision_OmitsSizeWhenUnset(t *testing.T) {
+	// The project never becomes ready, so Provision errors; only the create
+	// call's args matter here.
+	fake := &fakeCmdRunner{responses: []fakeCmdResponse{
+		{stdout: `{"ref":"proj123","name":"run-1"}`},                                             // projects create
+		{stdout: `{"projects":[{"ref":"proj123","status":"COMING_UP","database":{"host":""}}]}`}, // projects list
+		{stdout: ""}, // projects delete (self-cleanup)
+	}}
+	p := &Provider{
+		out: io.Discard, run: fake.run, checkCLI: noopCheckCLI,
+		pollTimeout: waitTimeout, pollInterval: waitInterval,
+		cfg: &config.Config{},
+	}
+	cfg := testProvisionConfig()
+	delete(cfg, "project_size")
+
+	_, _ = p.Provision(context.Background(), "run-1", cfg)
+	if len(fake.calls) == 0 || !slices.Contains(fake.calls[0], "create") {
+		t.Fatalf("expected a projects create call first, got %v", fake.calls)
+	}
+	if slices.Contains(fake.calls[0], "--size") {
+		t.Errorf("expected no --size in create args, got %v", fake.calls[0])
+	}
+}
+
 func TestProvision_WaitForProjectTimeout_SelfCleanupFails(t *testing.T) {
 	fake := &fakeCmdRunner{responses: []fakeCmdResponse{
 		{stdout: `{"ref":"proj123","name":"run-1"}`},                                             // projects create
@@ -812,8 +543,8 @@ func TestProvision_WaitForProjectTimeout_SelfCleanupFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "benchctl teardown run-1") {
 		t.Errorf("expected error to mention manual teardown, got %v", err)
 	}
-	want := engine.Outputs{outputKeyProjectRef: "proj123", outputKeyProfile: "", outputKeyRunID: "run-1"}
-	if len(outputs) != len(want) || outputs[outputKeyProjectRef] != "proj123" || outputs[outputKeyRunID] != "run-1" {
+	want := engine.Outputs{outputKeyProjectRefs: "proj123", outputKeyProfile: "", outputKeyRunID: "run-1", outputKeyProjectCount: "1"}
+	if !maps.Equal(outputs, want) {
 		t.Errorf("expected partial outputs %v, got %v", want, outputs)
 	}
 }
@@ -905,46 +636,39 @@ func TestProvision_CreateFails_ProjectFoundByName_CleanupFails(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "benchctl teardown run-1") {
 		t.Fatalf("expected the error to point at manual teardown, got %v", err)
 	}
-	if outputs[outputKeyProjectRef] != "proj123" || outputs[outputKeyRunID] != "run-1" {
+	if outputs[outputKeyProjectRefs] != "proj123" || outputs[outputKeyRunID] != "run-1" {
 		t.Errorf("expected partial outputs carrying the ref so teardown can finish, got %v", outputs)
 	}
 }
 
-func TestProvision_CreateFails_NoProjectExists(t *testing.T) {
+// When no project can be found, there is nothing to clean up, and no delete
+// is attempted.
+func TestProvision_CreateFails_NothingToCleanUp(t *testing.T) {
+	failed := fakeCmdResponse{stderr: "unauthorized", err: fmt.Errorf("exit status 1")}
 	empty := fakeCmdResponse{stdout: `{"projects":[]}`}
-	fake := &fakeCmdRunner{responses: []fakeCmdResponse{
-		{stdout: "", stderr: "unauthorized", err: fmt.Errorf("exit status 1")}, // projects create
-		empty, empty, empty, // projects list: nothing to recover
-	}}
-	p := &Provider{out: io.Discard, run: fake.run, checkCLI: noopCheckCLI, recoverLookupInterval: time.Nanosecond, cfg: &config.Config{}}
-	outputs, err := p.Provision(context.Background(), "run-1", testProvisionConfig())
-	if err == nil || !strings.Contains(err.Error(), "projects create") {
-		t.Fatalf("expected a projects-create error, got %v", err)
-	}
-	if outputs != nil {
-		t.Errorf("expected nil outputs when nothing was created, got %v", outputs)
-	}
-	if len(fake.calls) != 1+recoverLookupAttempts {
-		t.Fatalf("expected %d CLI calls with no delete attempt, got %d: %v", 1+recoverLookupAttempts, len(fake.calls), fake.calls)
-	}
-}
-
-func TestProvision_CreateFails_ListFails(t *testing.T) {
-	listErr := fakeCmdResponse{stdout: "", stderr: "network down", err: fmt.Errorf("exit status 1")}
-	fake := &fakeCmdRunner{responses: []fakeCmdResponse{
-		{stdout: createConflict, err: fmt.Errorf("exit status 1")}, // projects create
-		listErr, listErr, listErr, // projects list never answers
-	}}
-	p := &Provider{out: io.Discard, run: fake.run, checkCLI: noopCheckCLI, recoverLookupInterval: time.Nanosecond, cfg: &config.Config{}}
-	outputs, err := p.Provision(context.Background(), "run-1", testProvisionConfig())
-	if err == nil || !strings.Contains(err.Error(), "projects create") {
-		t.Fatalf("expected the original create error to survive a failed lookup, got %v", err)
-	}
-	if outputs != nil {
-		t.Errorf("expected nil outputs, got %v", outputs)
-	}
-	if len(fake.calls) != 1+recoverLookupAttempts {
-		t.Fatalf("expected %d CLI calls with no delete attempt, got %d: %v", 1+recoverLookupAttempts, len(fake.calls), fake.calls)
+	conflict := fakeCmdResponse{stdout: createConflict, err: fmt.Errorf("exit status 1")}
+	listErr := fakeCmdResponse{stderr: "network down", err: fmt.Errorf("exit status 1")}
+	for _, tc := range []struct {
+		name      string
+		responses []fakeCmdResponse
+	}{
+		{"no project exists", []fakeCmdResponse{failed, empty, empty, empty}},
+		{"the lookup never answers", []fakeCmdResponse{conflict, listErr, listErr, listErr}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeCmdRunner{responses: tc.responses}
+			p := &Provider{out: io.Discard, run: fake.run, checkCLI: noopCheckCLI, recoverLookupInterval: time.Nanosecond, cfg: &config.Config{}}
+			outputs, err := p.Provision(context.Background(), "run-1", testProvisionConfig())
+			if err == nil || !strings.Contains(err.Error(), "projects create") {
+				t.Fatalf("expected the create error to survive, got %v", err)
+			}
+			if outputs != nil {
+				t.Errorf("expected nil outputs, got %v", outputs)
+			}
+			if len(fake.calls) != 1+recoverLookupAttempts {
+				t.Fatalf("expected %d CLI calls with no delete attempt, got %d: %v", 1+recoverLookupAttempts, len(fake.calls), fake.calls)
+			}
+		})
 	}
 }
 
@@ -970,47 +694,339 @@ func TestProvision_CreateFails_RecoversAfterListLag(t *testing.T) {
 
 // --- projectRefByName ---
 
-func TestProjectRefByName_IgnoresOtherOrgs(t *testing.T) {
+func TestProjectRefByName(t *testing.T) {
 	data := []byte(`{"projects":[` +
 		`{"ref":"other","name":"run-1","organization_id":"org-999","organization_slug":"org-999"},` +
-		`{"ref":"proj123","name":"run-1","organization_id":"org-123","organization_slug":"org-123"}]}`)
-	got, err := projectRefByName(data, "run-1", "org-123")
-	if err != nil || got != "proj123" {
-		t.Fatalf("projectRefByName() = %q, %v; want proj123, nil", got, err)
+		`{"ref":"proj123","name":"run-1","organization_id":"abc","organization_slug":"org-123"}]}`)
+	// The org matches by slug or by id, and other orgs' projects are ignored.
+	for _, org := range []string{"org-123", "abc"} {
+		if got, err := projectRefByName(data, "run-1", org); err != nil || got != "proj123" {
+			t.Errorf("projectRefByName(org %s) = %q, %v; want proj123, nil", org, got, err)
+		}
 	}
 	if _, err := projectRefByName(data, "run-1", "org-absent"); err == nil {
 		t.Error("expected no match for an org that owns no project with that name")
 	}
 }
 
-func TestProjectRefByName_MatchesOrgSlug(t *testing.T) {
-	data := []byte(`{"projects":[{"ref":"proj123","name":"run-1","organization_id":"abc","organization_slug":"org-123"}]}`)
-	got, err := projectRefByName(data, "run-1", "org-123")
-	if err != nil || got != "proj123" {
-		t.Fatalf("projectRefByName() = %q, %v; want proj123, nil", got, err)
-	}
-}
-
 // --- Teardown idempotency ---
 
+// listedRefs is a `projects list` response listing the given refs.
+func listedRefs(refs ...string) string {
+	listed := make([]string, len(refs))
+	for i, ref := range refs {
+		listed[i] = fmt.Sprintf(`{"ref":%q,"status":"ACTIVE_HEALTHY"}`, ref)
+	}
+	return `{"projects":[` + strings.Join(listed, ",") + `]}`
+}
+
 func TestTeardown_AlreadyDeletedIsSuccess(t *testing.T) {
-	fake := &fakeCmdRunner{responses: []fakeCmdResponse{
-		{stdout: "", stderr: "Resource has been removed", err: fmt.Errorf("exit status 1")},
+	t.Run("no longer listed", func(t *testing.T) {
+		fake := &fakeCmdRunner{responses: []fakeCmdResponse{{stdout: listedRefs("other")}}}
+		p := &Provider{out: io.Discard, run: fake.run, checkCLI: noopCheckCLI, cfg: &config.Config{}}
+		if err := p.Teardown(context.Background(), engine.Outputs{outputKeyProjectRef: "proj123"}); err != nil {
+			t.Fatalf("expected an unlisted project to count as torn down, got %v", err)
+		}
+		if len(fake.calls) != 1 {
+			t.Errorf("made %d CLI calls, want only the projects list: %v", len(fake.calls), fake.calls)
+		}
+	})
+
+	t.Run("removed after listing", func(t *testing.T) {
+		fake := &fakeCmdRunner{responses: []fakeCmdResponse{
+			{stdout: listedRefs("proj123")},
+			{stderr: "Resource has been removed", err: fmt.Errorf("exit status 1")},
+		}}
+		p := &Provider{out: io.Discard, run: fake.run, checkCLI: noopCheckCLI, cfg: &config.Config{}}
+		if err := p.Teardown(context.Background(), engine.Outputs{outputKeyProjectRef: "proj123"}); err != nil {
+			t.Fatalf("expected an already-removed project to count as torn down, got %v", err)
+		}
+	})
+}
+
+func TestTeardown_FindsUnrecordedProjectsByName(t *testing.T) {
+	// The seed recorded before provisioning holds no refs: benchctl died
+	// before it learnt them.
+	listed := `{"projects":[
+		{"ref":"ref-1","name":"run-1-1","status":"COMING_UP"},
+		{"ref":"ref-2","name":"run-1-2","status":"ACTIVE_HEALTHY"},
+		{"ref":"ref-other","name":"run-1-3","status":"ACTIVE_HEALTHY"},
+		{"ref":"ref-unrelated","name":"someone-else","status":"ACTIVE_HEALTHY"}
+	]}`
+	fake := &fakeCLI{respond: func(args []string) fakeCmdResponse {
+		if slices.Contains(args, "list") {
+			return fakeCmdResponse{stdout: listed}
+		}
+		return fakeCmdResponse{}
 	}}
-	p := &Provider{out: io.Discard, run: fake.run, checkCLI: noopCheckCLI, cfg: &config.Config{}}
-	err := p.Teardown(context.Background(), engine.Outputs{outputKeyProjectRef: "proj123"})
-	if err != nil {
-		t.Fatalf("expected an already-removed project to count as torn down, got %v", err)
+	seed := refOutputs(providerConfig{ProjectCount: 2}, "run-1", nil)
+	if err := fake.provider().Teardown(context.Background(), seed); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if got, want := fake.lastArgs("delete"), []string{"ref-1", "ref-2"}; !slices.Equal(got, want) {
+		t.Errorf("deleted %v, want only the run's projects %v", got, want)
 	}
 }
 
-func TestTeardown_DeleteFailureIsReported(t *testing.T) {
-	fake := &fakeCmdRunner{responses: []fakeCmdResponse{
-		{stdout: "", stderr: "boom", err: fmt.Errorf("exit status 1")},
-	}}
-	p := &Provider{out: io.Discard, run: fake.run, checkCLI: noopCheckCLI, cfg: &config.Config{}}
-	err := p.Teardown(context.Background(), engine.Outputs{outputKeyProjectRef: "proj123"})
-	if err == nil || !strings.Contains(err.Error(), "projects delete proj123") {
-		t.Fatalf("expected a projects-delete error, got %v", err)
+func TestTeardownSeed(t *testing.T) {
+	p := &Provider{}
+	seed := p.TeardownSeed("run-1", map[string]any{
+		"region": "eu-central-1", "org_id": "org", "connection_mode": "direct", "project_count": "3", "profile": "supabase-local",
+	})
+	if got := runProjectNames(seed); !slices.Equal(got, []string{"run-1-1", "run-1-2", "run-1-3"}) {
+		t.Errorf("seed names %v", got)
 	}
+	if seed[outputKeyProfile] != "supabase-local" {
+		t.Errorf("seed profile = %q", seed[outputKeyProfile])
+	}
+	if p.TeardownSeed("run-1", map[string]any{"project_count": "-1"}) != nil {
+		t.Error("expected no seed for an invalid config")
+	}
+}
+
+func TestDeleteProject_RetriesUntilDeletable(t *testing.T) {
+	notReady := fakeCmdResponse{
+		stderr: `Failed to delete project ref-1: {"message":"Project not ready for deletion - please try again in 14 minutes."}`,
+		err:    fmt.Errorf("exit status 1"),
+	}
+	fake := &fakeCmdRunner{responses: []fakeCmdResponse{notReady, notReady, {}}}
+	p := &Provider{out: io.Discard, run: fake.run, deleteRetryInterval: time.Nanosecond}
+	if err := p.deleteProject(context.Background(), nil, "", "ref-1"); err != nil {
+		t.Fatalf("deleteProject: %v", err)
+	}
+	if len(fake.calls) != 3 {
+		t.Errorf("made %d delete calls, want 3", len(fake.calls))
+	}
+}
+
+func TestDeleteProject_StopsRetryingWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	notReady := fakeCmdResponse{stderr: "Project not ready for deletion", err: fmt.Errorf("exit status 1")}
+	fake := &fakeCmdRunner{responses: []fakeCmdResponse{notReady}}
+	p := &Provider{out: io.Discard, run: fake.run, deleteRetryInterval: time.Hour}
+	if err := p.deleteProject(ctx, nil, "", "ref-1"); err == nil {
+		t.Fatal("expected an error once the context is done")
+	}
+}
+
+// --- Multiple projects ---
+
+// fakeCLI answers supabase CLI calls by their arguments rather than call
+// order, so it works when projects are provisioned concurrently.
+type fakeCLI struct {
+	mu      sync.Mutex
+	calls   [][]string
+	respond func(args []string) fakeCmdResponse
+}
+
+func (f *fakeCLI) run(_ context.Context, _ []string, _ io.Writer, args ...string) ([]byte, []byte, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, slices.Clone(args))
+	f.mu.Unlock()
+	r := f.respond(args)
+	return []byte(r.stdout), []byte(r.stderr), r.err
+}
+
+// lastArgs returns the last argument of every call to subcommand, e.g. the
+// project name for "create" or the ref for "delete".
+func (f *fakeCLI) lastArgs(subcommand string) []string {
+	var out []string
+	for _, c := range f.calls {
+		if slices.Contains(c, subcommand) {
+			out = append(out, c[len(c)-1])
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func (f *fakeCLI) provider() *Provider {
+	return &Provider{out: io.Discard, run: f.run, checkCLI: noopCheckCLI, recoverLookupInterval: time.Nanosecond, cfg: &config.Config{}}
+}
+
+// healthyProjects answers as if creating each named project succeeds and it
+// is ACTIVE_HEALTHY straight away. A project's ref is "ref-" plus its name.
+func healthyProjects(names ...string) func(args []string) fakeCmdResponse {
+	var listed []string
+	for _, n := range names {
+		listed = append(listed, fmt.Sprintf(`{"ref":"ref-%[1]s","name":"%[1]s","organization_id":"org-123",`+
+			`"status":"ACTIVE_HEALTHY","database":{"host":"db.ref-%[1]s.supabase.red"}}`, n))
+	}
+	list := `{"projects":[` + strings.Join(listed, ",") + `]}`
+	return func(args []string) fakeCmdResponse {
+		last := args[len(args)-1]
+		switch {
+		case slices.Contains(args, "create"):
+			return fakeCmdResponse{stdout: fmt.Sprintf(`{"ref":"ref-%s"}`, last)}
+		case slices.Contains(args, "list"):
+			return fakeCmdResponse{stdout: list}
+		case slices.Contains(args, "api-keys"):
+			ref := args[slices.Index(args, "--project-ref")+1]
+			return fakeCmdResponse{stdout: fmt.Sprintf(`{"keys":[{"name":"anon","type":"legacy","api_key":"anon"},{"name":"default","type":"publishable","api_key":"pub-%s"}]}`, ref)}
+		default: // delete
+			return fakeCmdResponse{}
+		}
+	}
+}
+
+func TestProvision_Outputs(t *testing.T) {
+	t.Run("one project keeps the connection keys", func(t *testing.T) {
+		fake := &fakeCLI{respond: healthyProjects("run-1")}
+		outputs, err := fake.provider().Provision(context.Background(), "run-1", testProvisionConfig())
+		if err != nil {
+			t.Fatalf("Provision() error = %v", err)
+		}
+		for key, want := range map[string]string{
+			outputKeyProjectRefs:                  "ref-run-1",
+			outputKeyProjectRef:                   "ref-run-1",
+			"host":                                "db.ref-run-1.supabase.red",
+			outputKeyAPIURL + "ref-run-1":         "https://ref-run-1.supabase.red",
+			outputKeyPublishableKey + "ref-run-1": "pub-ref-run-1",
+		} {
+			if outputs[key] != want {
+				t.Errorf("outputs[%s] = %q, want %q", key, outputs[key], want)
+			}
+		}
+	})
+
+	t.Run("several projects are listed by ref", func(t *testing.T) {
+		fake := &fakeCLI{respond: healthyProjects("run-1-1", "run-1-2", "run-1-3")}
+		cfg := testProvisionConfig()
+		cfg["project_count"] = "3"
+		outputs, err := fake.provider().Provision(context.Background(), "run-1", cfg)
+		if err != nil {
+			t.Fatalf("Provision() error = %v", err)
+		}
+		if got, want := fake.lastArgs("create"), []string{"run-1-1", "run-1-2", "run-1-3"}; !slices.Equal(got, want) {
+			t.Errorf("created %v, want %v", got, want)
+		}
+		if got, want := outputs[outputKeyProjectRefs], "ref-run-1-1,ref-run-1-2,ref-run-1-3"; got != want {
+			t.Errorf("project_refs = %q, want %q", got, want)
+		}
+		if got, want := outputs[outputKeyPublishableKey+"ref-run-1-2"], "pub-ref-run-1-2"; got != want {
+			t.Errorf("publishable key = %q, want %q", got, want)
+		}
+		if got := len(fake.lastArgs("list")); got != 1 {
+			t.Errorf("polled projects list %d times, want once for all three projects", got)
+		}
+		for _, key := range []string{"host", "port", "user", outputKeyProjectRef} {
+			if _, ok := outputs[key]; ok {
+				t.Errorf("outputs[%s] is set, want it unset for several projects", key)
+			}
+		}
+	})
+}
+
+func TestProvision_OneProjectFails_EveryOtherProjectIsCleanedUpOrReturned(t *testing.T) {
+	healthy := healthyProjects("run-1-1", "run-1-3")
+	fake := &fakeCLI{respond: func(args []string) fakeCmdResponse {
+		if slices.Contains(args, "create") && args[len(args)-1] == "run-1-2" {
+			return fakeCmdResponse{stderr: "boom", err: fmt.Errorf("exit status 1")}
+		}
+		return healthy(args)
+	}}
+	cfg := testProvisionConfig()
+	cfg["project_count"] = "3"
+
+	outputs, err := fake.provider().Provision(context.Background(), "run-1", cfg)
+	if err == nil || !strings.Contains(err.Error(), "projects create") {
+		t.Fatalf("expected the failed create to be reported, got %v", err)
+	}
+	// However the race between the failure and the other projects plays out,
+	// each project that was created is either deleted or left for teardown.
+	left := projectRefs(outputs)
+	deleted := fake.lastArgs("delete")
+	for _, ref := range []string{"ref-run-1-1", "ref-run-1-3"} {
+		if slices.Contains(left, ref) == slices.Contains(deleted, ref) {
+			t.Errorf("%s: left for teardown = %v, deleted = %v; want exactly one", ref, slices.Contains(left, ref), slices.Contains(deleted, ref))
+		}
+	}
+}
+
+func TestTeardown_DeletesEveryProject(t *testing.T) {
+	fake := &fakeCLI{respond: func(args []string) fakeCmdResponse {
+		switch {
+		case slices.Contains(args, "list"):
+			return fakeCmdResponse{stdout: listedRefs("a", "b", "c")}
+		case args[len(args)-1] == "b":
+			return fakeCmdResponse{stderr: "boom", err: fmt.Errorf("exit status 1")}
+		}
+		return fakeCmdResponse{}
+	}}
+	err := fake.provider().Teardown(context.Background(), engine.Outputs{outputKeyProjectRefs: "a,b,c"})
+	if err == nil || !strings.Contains(err.Error(), "projects delete b") {
+		t.Fatalf("expected the failed delete to be reported, got %v", err)
+	}
+	if got, want := fake.lastArgs("delete"), []string{"a", "b", "c"}; !slices.Equal(got, want) {
+		t.Errorf("deleted %v, want %v (one failure must not stop the rest)", got, want)
+	}
+}
+
+func TestParsePositiveIntConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value   any
+		want    int
+		wantErr bool
+	}{
+		{value: nil, want: 7},
+		{value: "", want: 7},
+		{value: "5", want: 5},
+		{value: "-1", wantErr: true},
+	} {
+		got, err := parsePositiveIntConfig(map[string]any{"k": tc.value}, "k", 7)
+		if (err != nil) != tc.wantErr || (!tc.wantErr && got != tc.want) {
+			t.Errorf("value %v: got %d, %v; want %d, error %v", tc.value, got, err, tc.want, tc.wantErr)
+		}
+	}
+}
+
+func TestParseConfig_ParallelismDefaults(t *testing.T) {
+	c, err := parseConfig(testProvisionConfig())
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if c.ProjectCount != 1 || c.MaxParallelProjects != defaultMaxParallelProjects {
+		t.Errorf("project_count = %d, max_parallel_projects = %d; want 1, %d", c.ProjectCount, c.MaxParallelProjects, defaultMaxParallelProjects)
+	}
+}
+
+func TestRunCaptureErr_RetriesRateLimitedCalls(t *testing.T) {
+	throttled := fakeCmdResponse{
+		stderr: `Failed to delete project a: {"message":"ThrottlerException: Too Many Requests"}`,
+		err:    fmt.Errorf("exit status 1"),
+	}
+
+	t.Run("succeeds once the limit lifts", func(t *testing.T) {
+		fake := &fakeCmdRunner{responses: []fakeCmdResponse{throttled, throttled, {}}}
+		p := &Provider{out: io.Discard, run: fake.run, rateLimitBackoff: time.Nanosecond}
+		if _, _, err := p.runCaptureErr(context.Background(), nil, "projects", "delete", "a"); err != nil {
+			t.Fatalf("runCaptureErr() error = %v", err)
+		}
+		if len(fake.calls) != 3 {
+			t.Errorf("made %d calls, want 3", len(fake.calls))
+		}
+	})
+
+	t.Run("gives up after rateLimitRetries", func(t *testing.T) {
+		fake := &fakeCmdRunner{responses: slices.Repeat([]fakeCmdResponse{throttled}, rateLimitRetries+2)}
+		p := &Provider{out: io.Discard, run: fake.run, rateLimitBackoff: time.Nanosecond}
+		if _, _, err := p.runCaptureErr(context.Background(), nil, "projects", "delete", "a"); err == nil {
+			t.Fatal("expected the last rate-limited error")
+		}
+		if len(fake.calls) != rateLimitRetries+1 {
+			t.Errorf("made %d calls, want %d", len(fake.calls), rateLimitRetries+1)
+		}
+	})
+
+	t.Run("other failures are not retried", func(t *testing.T) {
+		fake := &fakeCmdRunner{responses: []fakeCmdResponse{{stderr: "boom", err: fmt.Errorf("exit status 1")}}}
+		p := &Provider{out: io.Discard, run: fake.run, rateLimitBackoff: time.Nanosecond}
+		if _, _, err := p.runCaptureErr(context.Background(), nil, "projects", "delete", "a"); err == nil {
+			t.Fatal("expected the failure to be returned")
+		}
+		if len(fake.calls) != 1 {
+			t.Errorf("made %d calls, want 1", len(fake.calls))
+		}
+	})
 }

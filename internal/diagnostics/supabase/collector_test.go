@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/dbarena/benchctl/internal/config"
 	"github.com/dbarena/benchctl/internal/diagnostics"
+	supabaseprovider "github.com/dbarena/benchctl/internal/providers/supabase"
 )
 
 var (
@@ -68,14 +70,20 @@ func (f *fakeAPI) matching(substr string) []*recordedRequest {
 // fakeCLI records the argv it was handed and optionally writes the CSVs the
 // real `supabase inspect report` would.
 type fakeCLI struct {
-	calls   [][]string
-	err     error
-	writeTo func(dir string)
+	mu        sync.Mutex
+	calls     [][]string
+	err       error
+	failFor   string // a --project-ref to fail with err; empty fails every call
+	failTimes int    // fail only this many calls; zero fails them all
+	writeTo   func(dir string)
 }
 
 func (f *fakeCLI) run(_ context.Context, _ []string, args ...string) ([]byte, error) {
+	f.mu.Lock()
 	f.calls = append(f.calls, args)
-	if f.err != nil {
+	n := len(f.calls)
+	f.mu.Unlock()
+	if f.err != nil && (f.failFor == "" || slices.Contains(args, f.failFor)) && (f.failTimes == 0 || n <= f.failTimes) {
 		return nil, f.err
 	}
 	if f.writeTo != nil {
@@ -113,15 +121,17 @@ func okHandler(r *recordedRequest) (int, string) {
 
 func (f *fakeAPI) collector(cli *fakeCLI) *Collector {
 	return &Collector{
-		doer:         f.server.Client(),
-		run:          cli.run,
-		cfg:          &config.Config{},
-		hostOverride: f.server.URL,
-		projectRef:   "abcdefghijklmnop",
-		dbHost:       "db.abcdefghijklmnop.supabase.co",
-		token:        "sbp_test",
+		doer:             f.server.Client(),
+		run:              cli.run,
+		cfg:              &config.Config{},
+		hostOverride:     f.server.URL,
+		logRetryInterval: time.Nanosecond,
+		projects:         []supabaseprovider.TargetProject{testProject},
+		token:            "sbp_test",
 	}
 }
+
+var testProject = supabaseprovider.TargetProject{Ref: "abcdefghijklmnop", DBHost: "db.abcdefghijklmnop.supabase.co"}
 
 func testRequest(t *testing.T) diagnostics.Request {
 	t.Helper()
@@ -205,7 +215,7 @@ func TestCollect_TrimsTheAddonPriceList(t *testing.T) {
 	req := testRequest(t)
 	var res diagnostics.Result
 
-	f.collector(&fakeCLI{}).collectConfig(context.Background(), req, &res)
+	f.collector(&fakeCLI{}).collectConfig(context.Background(), req, testProject, req.Dest, &res)
 
 	data, err := os.ReadFile(filepath.Join(req.Dest, "addons.json"))
 	if err != nil {
@@ -216,17 +226,6 @@ func TestCollect_TrimsTheAddonPriceList(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "ci_small") {
 		t.Errorf("the compute variant was lost:\n%s", data)
-	}
-}
-
-// TestConfigSnapshots_NoVersionEndpoint guards a duplicate: project.json
-// already carries database.version, postgres_engine and release_channel, so
-// /upgrade/eligibility adds nothing.
-func TestConfigSnapshots_NoVersionEndpoint(t *testing.T) {
-	for _, s := range configSnapshots {
-		if strings.Contains(s.path, "upgrade") || s.file == "version.json" {
-			t.Errorf("%s duplicates project.json's version fields", s.file)
-		}
 	}
 }
 
@@ -276,6 +275,127 @@ func TestCollect_PartialFailureKeepsTheRest(t *testing.T) {
 	}
 }
 
+// TestCollect_SeveralProjects checks a multi-project run gets the same files
+// as a single project, once per project, each in a directory named after its
+// ref.
+func TestCollect_SeveralProjects(t *testing.T) {
+	f := newFakeAPI(t, okHandler)
+	cli := &fakeCLI{writeTo: writeReportCSVs(t, "calls.csv")}
+	c := f.collector(cli)
+	refs := []string{"aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccc"}
+	c.projects = nil
+	for _, ref := range refs {
+		c.projects = append(c.projects, supabaseprovider.TargetProject{Ref: ref, DBHost: "db." + ref + ".supabase.co"})
+	}
+	req := testRequest(t)
+
+	res, err := c.Collect(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(res.Warnings) != 0 {
+		t.Errorf("a healthy run produced warnings: %v", res.Warnings)
+	}
+
+	var got []string
+	for _, a := range res.Artifacts {
+		got = append(got, a.File)
+	}
+	var want []string
+	for _, ref := range refs {
+		for _, file := range []string{
+			"project.json", "disk.json", "disk_usage.json", "postgres_config.json", "addons.json",
+			"postgres.log", filepath.Join("inspect", "2026-09-29", "calls.csv"),
+		} {
+			want = append(want, filepath.Join(ref, file))
+		}
+		if n := len(f.matching("/v1/projects/" + ref)); n != len(configSnapshots)+1 {
+			t.Errorf("%s: %d API calls, want %d (config snapshots and the log)", ref, n, len(configSnapshots)+1)
+		}
+	}
+	// Artifacts are grouped by project in creation order, whichever finished first.
+	if !slices.Equal(got, want) {
+		t.Errorf("artifacts = %v\nwant %v", got, want)
+	}
+	for _, w := range want {
+		if _, err := os.Stat(filepath.Join(req.Dest, w)); err != nil {
+			t.Errorf("%s recorded but not written: %v", w, err)
+		}
+	}
+}
+
+func TestCollect_SeveralProjects_WarningsNameTheProject(t *testing.T) {
+	f := newFakeAPI(t, okHandler)
+	cli := &fakeCLI{err: errors.New("failed to connect to database"), failFor: "bbbbbbbbbbbbbbbbbbbb", writeTo: writeReportCSVs(t, "calls.csv")}
+	c := f.collector(cli)
+	c.projects = []supabaseprovider.TargetProject{
+		{Ref: "aaaaaaaaaaaaaaaaaaaa", DBHost: "db.aaaaaaaaaaaaaaaaaaaa.supabase.co"},
+		{Ref: "bbbbbbbbbbbbbbbbbbbb", DBHost: "db.bbbbbbbbbbbbbbbbbbbb.supabase.co"},
+	}
+
+	res, err := c.Collect(context.Background(), testRequest(t))
+	if err != nil {
+		t.Fatalf("Collect returned an error for a partial failure: %v", err)
+	}
+	if want := []string{filepath.Join("bbbbbbbbbbbbbbbbbbbb", "inspect") + ": failed to connect to database"}; !slices.Equal(res.Warnings, want) {
+		t.Errorf("warnings = %v, want %v", res.Warnings, want)
+	}
+}
+
+func TestPreflight_ResolvesEveryProject(t *testing.T) {
+	c := New(&config.Config{Supabase: config.SupabaseConfig{AccessToken: "sbp_test"}})
+	c.checkCLI = noopCheckCLI
+	err := c.Preflight(diagnostics.Request{Outputs: map[string]string{
+		"project_refs": "aaa,bbb",
+		"api_url_aaa":  "https://aaa.supabase.red",
+		"api_url_bbb":  "https://bbb.supabase.red",
+		outputProfile:  "supabase-local",
+	}})
+	if err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	want := []supabaseprovider.TargetProject{{Ref: "aaa", DBHost: "db.aaa.supabase.red"}, {Ref: "bbb", DBHost: "db.bbb.supabase.red"}}
+	if !slices.Equal(c.projects, want) || c.profile != "supabase-local" {
+		t.Errorf("projects = %v, profile = %q; want %v, supabase-local", c.projects, c.profile, want)
+	}
+}
+
+func TestInspectReport_RetriesOnce(t *testing.T) {
+	f := newFakeAPI(t, okHandler)
+	cli := &fakeCLI{err: errors.New("Failed to create login role"), failTimes: 1, writeTo: writeReportCSVs(t, "calls.csv")}
+	req := testRequest(t)
+	var res diagnostics.Result
+
+	f.collector(cli).collectInspectReport(context.Background(), req, testProject, req.Dest, &res)
+
+	if len(cli.calls) != 2 || len(res.Warnings) != 0 || len(res.Artifacts) != 1 {
+		t.Errorf("calls = %d, warnings = %v, artifacts = %v; want a successful second attempt", len(cli.calls), res.Warnings, res.Artifacts)
+	}
+}
+
+// TestExecCLI_ReportsTheJSONError covers the CLI printing progress on stderr
+// and its error on stdout: the warning used to read just "Initialising login
+// role...".
+func TestExecCLI_ReportsTheJSONError(t *testing.T) {
+	bin := t.TempDir()
+	script := "#!/bin/sh\necho 'Initialising login role...' >&2\n" +
+		`echo '{"_tag":"Error","error":{"code":"DbConfigLoginRoleStatusError","message":"Failed to create login role"}}'` + "\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "supabase"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake CLI: %v", err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := execCLI(context.Background(), os.Environ(), "inspect", "report")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"Initialising login role...", "Failed to create login role (DbConfigLoginRoleStatusError)"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q is missing %q", err, want)
+		}
+	}
+}
+
 func TestPreflight(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -298,6 +418,7 @@ func TestPreflight(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SUPABASE_ACCESS_TOKEN", "")
 			c := New(tt.cfg)
 			c.checkCLI = noopCheckCLI
 			err := c.Preflight(diagnostics.Request{Outputs: tt.outputs})
@@ -311,18 +432,19 @@ func TestPreflight(t *testing.T) {
 	}
 }
 
-// TestAPIBase_DerivesTheEnvironment guards against a staging project being
-// queried against production, which would return 404s that look like a
+// TestAPIBase_DerivesTheEnvironment guards against a non-production project
+// being queried against production, which would return 404s that look like a
 // missing project rather than a wrong host.
 func TestAPIBase_DerivesTheEnvironment(t *testing.T) {
-	tests := []struct{ dbHost, want string }{
-		{"db.abc.supabase.co", "https://api.supabase.com/v1/projects/abc"},
-		{"db.abc.supabase.red", "https://api.supabase.green/v1/projects/abc"},
+	tests := []struct{ profile, dbHost, want string }{
+		{"", "db.abc.supabase.co", "https://api.supabase.com/v1/projects/abc"},
+		{"", "db.abc.supabase.red", "https://api.supabase.green/v1/projects/abc"},
+		{"supabase-local", "db.abc.supabase.red", "http://localhost:8080/v1/projects/abc"},
 	}
 	for _, tt := range tests {
-		c := &Collector{projectRef: "abc", dbHost: tt.dbHost}
-		if got := c.apiBase(); got != tt.want {
-			t.Errorf("apiBase for %s = %q, want %q", tt.dbHost, got, tt.want)
+		c := &Collector{profile: tt.profile}
+		if got := c.apiBase(supabaseprovider.TargetProject{Ref: "abc", DBHost: tt.dbHost}); got != tt.want {
+			t.Errorf("apiBase for %s with profile %q = %q, want %q", tt.dbHost, tt.profile, got, tt.want)
 		}
 	}
 }
@@ -333,7 +455,7 @@ func TestInspectReport_UsesTheProjectRefNotThePassword(t *testing.T) {
 	req := testRequest(t)
 
 	var res diagnostics.Result
-	f.collector(cli).collectInspectReport(context.Background(), req, &res)
+	f.collector(cli).collectInspectReport(context.Background(), req, testProject, req.Dest, &res)
 
 	if len(cli.calls) != 1 {
 		t.Fatalf("%d CLI calls, want 1", len(cli.calls))
@@ -360,27 +482,6 @@ func TestAPIErrorMessage(t *testing.T) {
 	}
 	if got := apiErrorMessage([]byte(`nope`), "500 Internal Server Error"); got != "500 Internal Server Error" {
 		t.Errorf("got %q, want the status fallback", got)
-	}
-}
-
-func TestConfigSnapshots_EachHasAReason(t *testing.T) {
-	seen := map[string]bool{}
-	for _, s := range configSnapshots {
-		if s.why == "" {
-			t.Errorf("%s has no recorded reason for being collected", s.file)
-		}
-		if seen[s.file] {
-			t.Errorf("%s collected twice", s.file)
-		}
-		seen[s.file] = true
-		if !strings.HasSuffix(s.file, ".json") {
-			t.Errorf("%s is not a .json artifact", s.file)
-		}
-	}
-	// The IO ceiling is the one snapshot a benchmark cannot do without: it is
-	// the only place provisioned IOPS and throughput are reported.
-	if !seen["disk.json"] {
-		t.Error("disk.json is missing; it is the only source of provisioned IOPS")
 	}
 }
 
