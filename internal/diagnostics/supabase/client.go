@@ -29,21 +29,21 @@ type httpDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-// apiBase returns the Management API root for this project, deriving the host
-// from the database hostname so a staging project is not silently queried
-// against production. The mapping lives in the Supabase provider, which
-// derives the pooler host the same way.
-func (c *Collector) apiBase() string {
+// apiBase returns the Management API root for project p: the provisioning
+// profile's API, or one derived from the database hostname, so a non-production
+// project is not silently queried against production. The mapping lives
+// in the Supabase provider, which calls the same API to resize disks.
+func (c *Collector) apiBase(p supabaseprovider.TargetProject) string {
 	if c.hostOverride != "" {
-		return c.hostOverride + "/v1/projects/" + c.projectRef
+		return c.hostOverride + "/v1/projects/" + p.Ref
 	}
-	return "https://" + supabaseprovider.ManagementAPIHost(c.dbHost) + "/v1/projects/" + c.projectRef
+	return supabaseprovider.ManagementAPIBase(c.profile, p.DBHost) + "/v1/projects/" + p.Ref
 }
 
 // get issues an authenticated GET against a Management API path relative to
-// the project, returning the body and the URL that produced it.
-func (c *Collector) get(ctx context.Context, path string, params url.Values) (body []byte, requestURL string, err error) {
-	requestURL = c.apiBase() + path
+// project p, returning the body and the URL that produced it.
+func (c *Collector) get(ctx context.Context, p supabaseprovider.TargetProject, path string, params url.Values) (body []byte, requestURL string, err error) {
+	requestURL = c.apiBase(p) + path
 	if len(params) > 0 {
 		requestURL += "?" + params.Encode()
 	}

@@ -5,17 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/dbarena/benchctl/internal/config"
 	"github.com/dbarena/benchctl/internal/diagnostics"
+	supabaseprovider "github.com/dbarena/benchctl/internal/providers/supabase"
 )
 
-// Output keys the collector addresses the project by, set by the Supabase
-// target provider.
-const (
-	outputProjectRef = "project_ref"
-	outputHost       = "host"
-)
+// maxParallelProjects caps how many projects of a multi-project run are
+// collected at once. Each one is a handful of Management API calls plus a
+// `supabase inspect report`, which opens its own database connection.
+const maxParallelProjects = 5
 
 // Collector implements diagnostics.Collector for Supabase targets.
 type Collector struct {
@@ -28,12 +30,14 @@ type Collector struct {
 
 	// hostOverride replaces the derived Management API base in tests.
 	hostOverride string
+	// logRetryInterval overrides the wait between log query retries; tests
+	// set a small value to avoid a real wait. Zero means the default.
+	logRetryInterval time.Duration
 
 	// Resolved once in Preflight.
-	projectRef string
-	dbHost     string
-	token      string
-	profile    string
+	projects []supabaseprovider.TargetProject
+	token    string
+	profile  string
 }
 
 var (
@@ -47,16 +51,15 @@ func New(cfg *config.Config) *Collector {
 
 func (c *Collector) Name() string { return diagnostics.VendorSupabase }
 
-// Preflight resolves the project identifiers and the access token once.
+// Preflight resolves the projects and the access token once.
 func (c *Collector) Preflight(req diagnostics.Request) error {
 	if err := c.requireCLI(); err != nil {
 		return err
 	}
 
-	c.projectRef = req.Outputs[outputProjectRef]
-	c.dbHost = req.Outputs[outputHost]
-	if c.projectRef == "" {
-		return fmt.Errorf("target declares vendor %q but exports no %s", diagnostics.VendorSupabase, outputProjectRef)
+	c.projects = supabaseprovider.TargetProjects(req.Outputs)
+	if len(c.projects) == 0 {
+		return fmt.Errorf("target declares vendor %q but exports no project_ref or project_refs", diagnostics.VendorSupabase)
 	}
 	c.profile = req.Outputs[outputProfile]
 
@@ -64,33 +67,89 @@ func (c *Collector) Preflight(req diagnostics.Request) error {
 		c.token = c.cfg.Supabase.AccessToken
 	}
 	if c.token == "" {
-		return errors.New("no Supabase access token; set BENCHCTL_SUPABASE_ACCESS_TOKEN or run `supabase login`")
+		// Not `supabase login`: that stores the token in the OS keyring, where
+		// the Management API calls here can't read it.
+		return errors.New("no Supabase access token; set BENCHCTL_SUPABASE_ACCESS_TOKEN")
 	}
 	return nil
 }
 
-// Collect gathers everything reachable and reports what it could not.
+// Collect gathers everything reachable for every project and reports what it
+// could not.
+//
+// A single project's artifacts go straight into the diagnostics directory, as
+// they always have. With several, each project gets a subdirectory named after
+// its ref, holding the same set of files.
 //
 // Nothing here is sliced per window. The log is the only time-bounded source
 // Supabase offers, and it reads better as one continuous record; every other
 // artifact is a snapshot with no history behind it.
 func (c *Collector) Collect(ctx context.Context, req diagnostics.Request) (diagnostics.Result, error) {
+	if len(c.projects) == 1 {
+		res := c.collectProject(ctx, req, c.projects[0], req.Dest, req.Reportf)
+		return res, collectErr(res)
+	}
+
+	// Each project fills its own Result, merged afterwards in creation order,
+	// so the index doesn't depend on which project finished first.
+	results := make([]diagnostics.Result, len(c.projects))
+	supabaseprovider.ForEachParallel(len(c.projects), maxParallelProjects, func(i int) {
+		p := c.projects[i]
+		reportf := func(format string, args ...any) {
+			req.Reportf("project %d/%d %s: "+format, append([]any{i + 1, len(c.projects), p.Ref}, args...)...)
+		}
+		dir := filepath.Join(req.Dest, p.Ref)
+		results[i] = c.collectProject(ctx, req, p, dir, reportf)
+	})
+
 	var res diagnostics.Result
+	for _, r := range results {
+		res.Artifacts = append(res.Artifacts, r.Artifacts...)
+		res.Warnings = append(res.Warnings, r.Warnings...)
+	}
+	return res, collectErr(res)
+}
+
+// collectProject gathers one project's configuration, log and catalogue
+// snapshot into dir.
+func (c *Collector) collectProject(ctx context.Context, req diagnostics.Request, p supabaseprovider.TargetProject,
+	dir string, reportf func(format string, args ...any),
+) diagnostics.Result {
+	var res diagnostics.Result
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", p.Ref, err))
+		return res
+	}
 	start, end := req.Span()
 
-	req.Reportf("project, disk and Postgres configuration")
-	c.collectConfig(ctx, req, &res)
+	reportf("project, disk and Postgres configuration")
+	c.collectConfig(ctx, req, p, dir, &res)
 
-	req.Reportf("Postgres log from the analytics endpoint")
-	c.collectLog(ctx, req, start, end, &res)
+	reportf("Postgres log from the analytics endpoint")
+	c.collectLog(ctx, req, p, dir, start, end, &res)
 
-	req.Reportf("catalogue snapshot via `supabase inspect report`")
-	c.collectInspectReport(ctx, req, &res)
+	reportf("catalogue snapshot via `supabase inspect report`")
+	c.collectInspectReport(ctx, req, p, dir, &res)
 
-	if len(res.Artifacts) == 0 {
-		return res, errors.New("every Supabase source failed; see the warnings above")
+	return res
+}
+
+// artifactName names a file in dir the way the index does, relative to the
+// diagnostics directory, so with several projects a warning says which one
+// it's about.
+func artifactName(req diagnostics.Request, dir, name string) string {
+	if rel, err := filepath.Rel(req.Dest, filepath.Join(dir, name)); err == nil {
+		return rel
 	}
-	return res, nil
+	return name
+}
+
+// collectErr fails the collection only when no source produced anything.
+func collectErr(res diagnostics.Result) error {
+	if len(res.Artifacts) == 0 {
+		return errors.New("every Supabase source failed; see the warnings above")
+	}
+	return nil
 }
 
 // checkCLI is injected so tests do not depend on whether the host has the
