@@ -1,7 +1,13 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/dbarena/benchctl/internal/engine"
+	"github.com/dbarena/benchctl/internal/runstate"
+	"github.com/dbarena/benchctl/internal/tofustate"
 )
 
 func TestPatchOutputPaths(t *testing.T) {
@@ -43,5 +49,46 @@ func TestPatchOutputPaths_NoMatchLeavesUntouched(t *testing.T) {
 
 	if got := outputs["public_ip"]; got != "10.0.0.1" {
 		t.Errorf("public_ip should be unchanged: got %q", got)
+	}
+}
+
+func TestRestoreTofuWorkDirs_RestoresTheRunFilesDir(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "manifest.jsonl"), []byte("m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := tofustate.Pack(map[string]string{engine.TargetFilesComponent: src})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The machine that ran this never had the directory.
+	gone := filepath.Join(t.TempDir(), "elsewhere")
+	state := &runstate.State{
+		TofuState: blob,
+		TargetOutputs: map[string]string{
+			engine.OutputKeyRunFilesDir: gone,
+			"projects_manifest":         filepath.Join(gone, "manifest.jsonl"),
+		},
+	}
+	if err := restoreTofuWorkDirs(state, false); err != nil {
+		t.Fatalf("restoreTofuWorkDirs: %v", err)
+	}
+	got, err := os.ReadFile(state.TargetOutputs["projects_manifest"])
+	if err != nil || string(got) != "m\n" {
+		t.Errorf("projects_manifest = %q -> %q, %v; want the restored copy", state.TargetOutputs["projects_manifest"], got, err)
+	}
+	if state.TargetOutputs[engine.OutputKeyRunFilesDir] == gone {
+		t.Error("the run files directory still points at the missing one")
+	}
+}
+
+func TestRestoreTofuWorkDirs_NoBlobLeavesTheRunFilesDirAlone(t *testing.T) {
+	gone := filepath.Join(t.TempDir(), "elsewhere")
+	state := &runstate.State{TargetOutputs: map[string]string{engine.OutputKeyRunFilesDir: gone}}
+	if err := restoreTofuWorkDirs(state, false); err != nil {
+		t.Fatalf("restoreTofuWorkDirs: %v", err)
+	}
+	if state.TargetOutputs[engine.OutputKeyRunFilesDir] != gone {
+		t.Error("the path changed with nothing to restore from")
 	}
 }

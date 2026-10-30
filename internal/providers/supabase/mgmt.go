@@ -266,6 +266,9 @@ func mgmtRefOutputs(c providerConfig, runID string, projects []project) engine.O
 	}
 	if c.ProjectCount > 1 {
 		out[outputKeyProjectsManifest] = filepath.Join(workDirForRun(runID), manifestFile)
+		// The manifest is the only record of the run's projects, so it
+		// travels with the run's state to other machines.
+		out[engine.OutputKeyRunFilesDir] = workDirForRun(runID)
 		return diagnosticsOutputs(c, out)
 	}
 	refs := make([]string, len(projects))

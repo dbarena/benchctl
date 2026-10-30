@@ -13,14 +13,19 @@ import (
 // restoreTofuWorkDirs unpacks state.TofuState into a fresh temp directory and
 // updates _tofu_work_dir (and any output path rooted under it, such as
 // ssh_private_key_path) for any component whose original work dir no longer
-// exists on disk. With force it restores from the blob even when the local dirs
-// are still there.
+// exists on disk. The target's run files directory is restored the same way,
+// and the output paths under it, such as projects_manifest, follow it. With
+// force it restores from the blob even when the local dirs are still there.
 func restoreTofuWorkDirs(state *runstate.State, force bool) error {
 	targetWD := state.TargetOutputs[engine.OutputKeyTofuWorkDir]
 	driverWD := state.DriverOutputs[engine.OutputKeyTofuWorkDir]
+	filesDir := state.TargetOutputs[engine.OutputKeyRunFilesDir]
 	targetMissing := targetWD != "" && (force || !pathExists(targetWD))
 	driverMissing := driverWD != "" && (force || !pathExists(driverWD))
-	if !targetMissing && !driverMissing {
+	// A run recorded in a store only this machine can read has no blob, and
+	// its files directory is already here if this is the machine that ran it.
+	filesMissing := filesDir != "" && state.TofuState != "" && (force || !pathExists(filesDir))
+	if !targetMissing && !driverMissing && !filesMissing {
 		return nil
 	}
 	restored, err := tofustate.Unpack(state.TofuState)
@@ -35,6 +40,11 @@ func restoreTofuWorkDirs(state *runstate.State, force bool) error {
 	if driverMissing {
 		if dir, ok := restored["driver"]; ok {
 			patchOutputPaths(state.DriverOutputs, driverWD, dir)
+		}
+	}
+	if filesMissing {
+		if dir, ok := restored[engine.TargetFilesComponent]; ok {
+			patchOutputPaths(state.TargetOutputs, filesDir, dir)
 		}
 	}
 	return nil

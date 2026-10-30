@@ -14,6 +14,18 @@ type Outputs map[string]string
 // the working directory path between Provision and Teardown.
 const OutputKeyTofuWorkDir = "_tofu_work_dir"
 
+// OutputKeyRunFilesDir is the Outputs key a target provider sets to a
+// directory of files that belong to the run, such as a list of what it
+// created. When the run's store is shared, the directory's contents are saved
+// with the run's state, so a machine that did not provision the run can
+// restore them: see packTofuState. Output values under the directory are
+// rewritten to the restored copy.
+const OutputKeyRunFilesDir = "_run_files_dir"
+
+// TargetFilesComponent names the target's run files directory in the packed
+// state blob, next to "target" and "driver" for the OpenTofu work dirs.
+const TargetFilesComponent = "target_files"
+
 // Metrics is the opaque result produced by a workload run and consumed by the
 // collector. Adapters populate it; collectors store or print it.
 type Metrics map[string]any

@@ -514,6 +514,9 @@ func TestMgmtProvision_Outputs(t *testing.T) {
 		if outputs[outputKeyProjectsManifest] != filepath.Join(workDirForRun("run-1"), manifestFile) || outputs[outputKeyProjectsReady] != "3" {
 			t.Errorf("outputs = %v, want the manifest and the ready count", outputs)
 		}
+		if outputs[engine.OutputKeyRunFilesDir] != workDirForRun("run-1") {
+			t.Errorf("run files dir = %q, want the directory that holds the manifest, so it travels with the run", outputs[engine.OutputKeyRunFilesDir])
+		}
 		// Per-project keys would outgrow the workload's argv at scale.
 		for key := range outputs {
 			if key == outputKeyProjectRefs || key == "host" || key == outputKeyProjectRef ||
