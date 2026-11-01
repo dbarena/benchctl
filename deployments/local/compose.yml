@@ -2,7 +2,7 @@ name: benchctl-observability
 
 services:
   victoriametrics:
-    image: victoriametrics/victoria-metrics:v1.141.0
+    image: victoriametrics/victoria-metrics:v1.155.0
     ports:
       - "8428:8428"
     command:
