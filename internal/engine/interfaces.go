@@ -37,6 +37,14 @@ type TargetProvider interface {
 	Teardown(ctx context.Context, outputs Outputs) error
 }
 
+// TeardownSeeder is implemented by target providers whose Teardown can find a
+// run's infrastructure from the run ID and config alone. The runner records
+// the seed before Provision starts and tears down with it when Provision
+// returns no outputs, so nothing leaks even if benchctl dies mid-provision.
+type TeardownSeeder interface {
+	TeardownSeed(runID string, cfg map[string]any) Outputs
+}
+
 // DriverProvider provisions, sets up, collects results from, and tears down
 // the driver instance that generates the load.
 //

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/dbarena/benchctl/internal/diagnostics"
+	supabaseprovider "github.com/dbarena/benchctl/internal/providers/supabase"
 )
 
 // outputProfile carries the CLI profile provisioning used, so collection
@@ -31,7 +32,9 @@ func execCLI(ctx context.Context, env []string, args ...string) ([]byte, error) 
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+		// The CLI prints progress on stderr but its error on stdout, as JSON.
+		msg := strings.TrimPrefix(strings.TrimSpace(stderr.String())+supabaseprovider.CLIErrorDetail(out), ": ")
+		if msg != "" {
 			return nil, fmt.Errorf("%w: %s", err, msg)
 		}
 		return nil, err
@@ -39,8 +42,8 @@ func execCLI(ctx context.Context, env []string, args ...string) ([]byte, error) 
 	return out, nil
 }
 
-// collectInspectReport runs `supabase inspect report`, which dumps a
-// catalogue snapshot as CSVs in one call.
+// collectInspectReport runs `supabase inspect report` for project p, which
+// dumps a catalogue snapshot as CSVs into projectDir/inspect in one call.
 //
 // This is where the SQL-level data comes from. Supabase has no Performance
 // Insights equivalent, but the report includes calls.csv and outliers.csv,
@@ -52,16 +55,21 @@ func execCLI(ctx context.Context, env []string, args ...string) ([]byte, error) 
 //
 // --project-ref rather than --db-url on purpose: the CLI then authenticates
 // with the access token already needed for the log endpoint.
-func (c *Collector) collectInspectReport(ctx context.Context, req diagnostics.Request, res *diagnostics.Result) {
-	dir := filepath.Join(req.Dest, inspectDirName)
-	args := []string{"inspect", "report", "--project-ref", c.projectRef, "--output-dir", dir}
+func (c *Collector) collectInspectReport(ctx context.Context, req diagnostics.Request, p supabaseprovider.TargetProject, projectDir string, res *diagnostics.Result) {
+	dir := filepath.Join(projectDir, inspectDirName)
+	name := artifactName(req, projectDir, inspectDirName)
+	args := []string{"inspect", "report", "--project-ref", p.Ref, "--output-dir", dir}
 	if c.profile != "" {
 		args = append(args, "--profile", c.profile)
 	}
 	command := "supabase " + strings.Join(args, " ")
 
-	if _, err := c.run(ctx, c.env(), args...); err != nil {
-		res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", inspectDirName, err))
+	_, err := c.run(ctx, c.env(), args...)
+	if err != nil && ctx.Err() == nil {
+		_, err = c.run(ctx, c.env(), args...)
+	}
+	if err != nil {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", name, err))
 		return
 	}
 
@@ -70,11 +78,11 @@ func (c *Collector) collectInspectReport(ctx context.Context, req diagnostics.Re
 	// to record it.
 	files, err := csvFilesUnder(dir)
 	if err != nil {
-		res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", inspectDirName, err))
+		res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", name, err))
 		return
 	}
 	if len(files) == 0 {
-		res.Warnings = append(res.Warnings, inspectDirName+": the report produced no CSVs")
+		res.Warnings = append(res.Warnings, name+": the report produced no CSVs")
 		return
 	}
 	for _, f := range files {

@@ -18,7 +18,7 @@ func TestCollectLog_RequestShape(t *testing.T) {
 	req := testRequest(t)
 	var res diagnostics.Result
 
-	f.collector(&fakeCLI{}).collectLog(context.Background(), req, winStart, winEnd, &res)
+	f.collector(&fakeCLI{}).collectLog(context.Background(), req, testProject, req.Dest, winStart, winEnd, &res)
 
 	reqs := f.matching("/analytics/endpoints/logs")
 	if len(reqs) != 1 {
@@ -55,7 +55,7 @@ func TestCollectLog_ErrorInsideA200(t *testing.T) {
 	req := testRequest(t)
 	var res diagnostics.Result
 
-	f.collector(&fakeCLI{}).collectLog(context.Background(), req, winStart, winEnd, &res)
+	f.collector(&fakeCLI{}).collectLog(context.Background(), req, testProject, req.Dest, winStart, winEnd, &res)
 
 	if len(res.Artifacts) != 0 {
 		t.Errorf("wrote a log despite the error: %v", res.Artifacts)
@@ -110,7 +110,7 @@ func TestCollectLog_LongSpanIsRequestedInSlices(t *testing.T) {
 	req := testRequest(t)
 	var res diagnostics.Result
 
-	f.collector(&fakeCLI{}).collectLog(context.Background(), req, winStart, winStart.Add(50*time.Hour), &res)
+	f.collector(&fakeCLI{}).collectLog(context.Background(), req, testProject, req.Dest, winStart, winStart.Add(50*time.Hour), &res)
 
 	if got := len(f.matching("/analytics/endpoints/logs")); got != 3 {
 		t.Errorf("%d requests for a 50 hour span, want 3", got)
@@ -181,9 +181,60 @@ func TestCollectLog_ReportsTheRowLimit(t *testing.T) {
 	req := testRequest(t)
 	var res diagnostics.Result
 
-	f.collector(&fakeCLI{}).collectLog(context.Background(), req, winStart, winEnd, &res)
+	f.collector(&fakeCLI{}).collectLog(context.Background(), req, testProject, req.Dest, winStart, winEnd, &res)
 
 	if !strings.Contains(strings.Join(res.Warnings, " "), "row limit") {
 		t.Errorf("hitting the row limit was not reported: %v", res.Warnings)
+	}
+}
+
+func TestCollectLog_RetriesATransientBackendError(t *testing.T) {
+	backendError := `{"result":null,"error":"Backend error! Retry your query. Please contact support if this continues."}`
+	for _, tc := range []struct {
+		name      string
+		failures  int
+		wantCalls int
+		wantLog   bool
+	}{
+		{name: "recovers", failures: logQueryAttempts - 1, wantCalls: logQueryAttempts, wantLog: true},
+		{name: "gives up", failures: logQueryAttempts, wantCalls: logQueryAttempts, wantLog: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int
+			f := newFakeAPI(t, func(r *recordedRequest) (int, string) {
+				calls++
+				if calls <= tc.failures {
+					return 200, backendError
+				}
+				return okHandler(r)
+			})
+			req := testRequest(t)
+			var res diagnostics.Result
+
+			f.collector(&fakeCLI{}).collectLog(context.Background(), req, testProject, req.Dest, winStart, winEnd, &res)
+
+			if calls != tc.wantCalls {
+				t.Errorf("%d queries, want %d", calls, tc.wantCalls)
+			}
+			if got := len(res.Artifacts) == 1; got != tc.wantLog {
+				t.Errorf("log written = %v, want %v (warnings %v)", got, tc.wantLog, res.Warnings)
+			}
+		})
+	}
+}
+
+func TestCollectLog_OtherErrorsAreNotRetried(t *testing.T) {
+	var calls int
+	f := newFakeAPI(t, func(*recordedRequest) (int, string) {
+		calls++
+		return 200, `{"result":null,"error":"syntax error at or near select"}`
+	})
+	req := testRequest(t)
+	var res diagnostics.Result
+
+	f.collector(&fakeCLI{}).collectLog(context.Background(), req, testProject, req.Dest, winStart, winEnd, &res)
+
+	if calls != 1 {
+		t.Errorf("%d queries, want 1", calls)
 	}
 }
