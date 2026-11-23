@@ -11,6 +11,7 @@ import (
 	"github.com/dbarena/benchctl/internal/engine"
 	"github.com/dbarena/benchctl/internal/runstate"
 	"github.com/dbarena/benchctl/internal/schema"
+	"github.com/dbarena/benchctl/internal/tofustate"
 )
 
 // ---- stub implementations ----
@@ -712,6 +713,52 @@ func TestTofuStatePacked_AfterProvision(t *testing.T) {
 	}
 	if states[0].TofuState == "" {
 		t.Error("TofuState should be non-empty after provision with opentofu target")
+	}
+}
+
+// stubFilesTarget is a target that records its run files in a directory
+// rather than an OpenTofu work dir.
+type stubFilesTarget struct {
+	stubTarget
+	dir string
+}
+
+func (s *stubFilesTarget) Provision(ctx context.Context, runID string, cfg map[string]any) (engine.Outputs, error) {
+	out, err := s.stubTarget.Provision(ctx, runID, cfg)
+	out[engine.OutputKeyRunFilesDir] = s.dir
+	return out, err
+}
+
+func TestRunFilesDirPacked_WithSharedStore(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/manifest.jsonl", []byte(`{"e":"ready"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []string
+	store := newMemStore()
+	r := engine.Runner{
+		Target:    &stubFilesTarget{stubTarget: stubTarget{calls: &calls}, dir: dir},
+		Driver:    &stubDriver{calls: &calls},
+		Workloads: map[string]engine.WorkloadAdapter{"go-tpc": &stubWorkload{calls: &calls}},
+		Collector: &stubCollector{calls: &calls},
+		Store:     store,
+	}
+	if err := r.Run(context.Background(), minimalScenario(), schema.ResolvedInputs{"warehouses": int64(10)}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	states, _ := store.List()
+	if len(states) != 1 || states[0].TofuState == "" {
+		t.Fatalf("want one run with a packed state, got %d runs", len(states))
+	}
+	restored, err := tofustate.Unpack(states[0].TofuState)
+	if err != nil {
+		t.Fatalf("Unpack: %v", err)
+	}
+	got, err := os.ReadFile(restored[engine.TargetFilesComponent] + "/manifest.jsonl")
+	if err != nil || string(got) != `{"e":"ready"}`+"\n" {
+		t.Errorf("restored manifest = %q, %v", got, err)
 	}
 }
 

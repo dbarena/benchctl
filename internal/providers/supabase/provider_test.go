@@ -173,7 +173,7 @@ func TestManagementAPIBase(t *testing.T) {
 
 func TestTargetProjects(t *testing.T) {
 	t.Run("several projects", func(t *testing.T) {
-		got := TargetProjects(engine.Outputs{
+		got, _ := TargetProjects(engine.Outputs{
 			outputKeyProjectRefs:          "a,b",
 			outputKeyAPIURL + "a":         "https://a.supabase.red",
 			outputKeyAPIURL + "b":         "https://b.supabase.red",
@@ -186,14 +186,14 @@ func TestTargetProjects(t *testing.T) {
 	})
 
 	t.Run("single project from before api_url", func(t *testing.T) {
-		got := TargetProjects(engine.Outputs{outputKeyProjectRef: "a", "host": "db.a.supabase.co"})
+		got, _ := TargetProjects(engine.Outputs{outputKeyProjectRef: "a", "host": "db.a.supabase.co"})
 		if want := []TargetProject{{Ref: "a", DBHost: "db.a.supabase.co"}}; !slices.Equal(got, want) {
 			t.Errorf("TargetProjects() = %v, want %v", got, want)
 		}
 	})
 
 	t.Run("no projects", func(t *testing.T) {
-		if got := TargetProjects(engine.Outputs{}); len(got) != 0 {
+		if got, _ := TargetProjects(engine.Outputs{}); len(got) != 0 {
 			t.Errorf("TargetProjects() = %v, want none", got)
 		}
 	})
@@ -994,6 +994,35 @@ func TestParseConfig_ParallelismDefaults(t *testing.T) {
 	}
 	if c.ProjectCount != 1 || c.MaxParallelProjects != defaultMaxParallelProjects {
 		t.Errorf("project_count = %d, max_parallel_projects = %d; want 1, %d", c.ProjectCount, c.MaxParallelProjects, defaultMaxParallelProjects)
+	}
+}
+
+func TestParseConfig_DiagnosticsSettings(t *testing.T) {
+	cfg := testProvisionConfig()
+	cfg["diagnostics_max_projects"] = "20"
+	cfg["diagnostics_parallel"] = "8"
+	c, err := parseConfig(cfg)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	for name, out := range map[string]engine.Outputs{
+		"CLI":      refOutputs(c, "run", nil),
+		"mgmt API": mgmtRefOutputs(c, "run", nil),
+	} {
+		if out[outputKeyDiagnosticsMaxProjects] != "20" || out[outputKeyDiagnosticsParallel] != "8" {
+			t.Errorf("%s outputs = %v, want the diagnostics settings", name, out)
+		}
+	}
+
+	// Unset means the collector's defaults: no output at all.
+	c, _ = parseConfig(testProvisionConfig())
+	if out := refOutputs(c, "run", nil); out[outputKeyDiagnosticsMaxProjects] != "" || out[outputKeyDiagnosticsParallel] != "" {
+		t.Errorf("unset settings still produced outputs: %v", out)
+	}
+
+	cfg["diagnostics_parallel"] = "-1"
+	if _, err := parseConfig(cfg); err == nil {
+		t.Error("parseConfig accepted diagnostics_parallel = -1")
 	}
 }
 

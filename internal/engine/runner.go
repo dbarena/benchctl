@@ -1524,7 +1524,8 @@ func (r *Runner) seedTargetTeardown(runID string, cfg map[string]any) Outputs {
 }
 
 // packTofuState packs the OpenTofu working directories from targetOutputs and
-// driverOutputs into a single blob and writes it to the run state store.
+// driverOutputs, and the target's run files directory, into a single blob and
+// writes it to the run state store.
 //
 // A no-op when the store is nil, when neither provider used OpenTofu, or when
 // the store is not shared. The blob exists only so teardown can restore the
@@ -1536,12 +1537,15 @@ func (r *Runner) packTofuState(runID string, targetOutputs, driverOutputs Output
 	if r.Store == nil || !r.storeIsShared() {
 		return
 	}
-	dirs := make(map[string]string, 2)
+	dirs := make(map[string]string, 3)
 	if wd := targetOutputs[OutputKeyTofuWorkDir]; wd != "" {
 		dirs["target"] = wd
 	}
 	if wd := driverOutputs[OutputKeyTofuWorkDir]; wd != "" {
 		dirs["driver"] = wd
+	}
+	if dir := targetOutputs[OutputKeyRunFilesDir]; dir != "" {
+		dirs[TargetFilesComponent] = dir
 	}
 	if len(dirs) == 0 {
 		return

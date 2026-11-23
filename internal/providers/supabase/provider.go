@@ -1,5 +1,7 @@
-// Package supabase implements a TargetProvider that provisions a Supabase
-// cloud database project via the Supabase CLI (beta channel).
+// Package supabase implements a TargetProvider that provisions Supabase cloud
+// database projects via the Supabase CLI (beta channel). With
+// config.management_api: true it calls the Management API directly instead
+// (see mgmt).
 package supabase
 
 import (
@@ -43,6 +45,9 @@ const (
 	// _supabase_profile stores the CLI profile used at provision time so
 	// teardown can use the same profile on a fresh CI runner.
 	outputKeyProfile = "_supabase_profile"
+	// The diagnostics collector reads these two, to size post-run collection.
+	outputKeyDiagnosticsMaxProjects = "_supabase_diagnostics_max_projects"
+	outputKeyDiagnosticsParallel    = "_supabase_diagnostics_parallel"
 	// _supabase_run_id stores the run ID so teardown can remove the local
 	// working directory on success.
 	outputKeyRunID = "_supabase_run_id"
@@ -125,6 +130,12 @@ type Provider struct {
 	doer httpDoer
 	run  cmdRunner
 	cfg  *config.Config
+
+	// throttleSkipToken is the throttle_skip_token Provision was given, kept
+	// in memory only so that the Teardown that ends the same run can send it
+	// too. It is a secret, so it never goes into the run's outputs, and a
+	// `benchctl teardown` run later on has none.
+	throttleSkipToken string
 
 	// checkCLI is injected so tests can bypass the real exec.LookPath("supabase")
 	// check, which verifies nothing about the (already-faked) run field;
@@ -245,6 +256,19 @@ type providerConfig struct {
 	ProjectCount        int
 	MaxParallelProjects int
 	ConnectionMode      string
+
+	// The Management API path (see mgmt).
+	ManagementAPI     bool
+	ManagementAPIURL  string
+	ThrottleSkipToken string
+	RequireHostSuffix string
+	MaxFailedProjects int
+	// DiagnosticsMaxProjects and DiagnosticsParallel tune post-run collection
+	// (benchctl fetch); zero means the collector's default.
+	DiagnosticsMaxProjects int
+	DiagnosticsParallel    int
+	ReadyTimeout           time.Duration
+
 	DiskSizeGB          int
 	DiskIOPS            int
 	DiskThroughputMibps int
@@ -292,6 +316,12 @@ func parseConfig(cfg map[string]any) (providerConfig, error) {
 	if c.MaxParallelProjects, err = parsePositiveIntConfig(cfg, "max_parallel_projects", defaultMaxParallelProjects); err != nil {
 		return c, err
 	}
+	if c.DiagnosticsMaxProjects, err = parsePositiveIntConfig(cfg, "diagnostics_max_projects", 0); err != nil {
+		return c, err
+	}
+	if c.DiagnosticsParallel, err = parsePositiveIntConfig(cfg, "diagnostics_parallel", 0); err != nil {
+		return c, err
+	}
 	if c.DiskSizeGB, err = parseIntConfig(cfg, "disk_size_gb"); err != nil {
 		return c, err
 	}
@@ -309,7 +339,7 @@ func parseConfig(cfg map[string]any) (providerConfig, error) {
 	default:
 		return c, fmt.Errorf("config.disk_type %q is invalid: must be gp3 or io2", c.DiskType)
 	}
-	return c, nil
+	return parseManagementAPIConfig(cfg, c)
 }
 
 // parseIntConfig coerces cfg[key] (arriving as a string post-templating, or
@@ -359,6 +389,10 @@ func parsePositiveIntConfig(cfg map[string]any, key string, def int) (int, error
 //	project_count    int      number of projects to create (optional, default 1)
 //	max_parallel_projects int how many projects to create at once (optional,
 //	                          default 10)
+//	diagnostics_max_projects int how many projects `benchctl fetch` collects from
+//	                          a Management API run (optional, default 5)
+//	diagnostics_parallel int  how many projects it collects at once (optional,
+//	                          default 5)
 //	project_size     string   instance size, e.g. "micro" (optional; when unset
 //	                          --size is omitted and the API picks the
 //	                          organisation's default size)
@@ -396,7 +430,13 @@ func parsePositiveIntConfig(cfg map[string]any, key string, def int) (int, error
 // Outputs always include project_refs, plus api_url_<ref> and
 // publishable_key_<ref> for each project. A single project also gets host,
 // port, user and project_ref.
+//
+// With management_api: true, the projects are created through the Management
+// API instead (see mgmt.provision for its keys and outputs).
 func (p *Provider) Provision(ctx context.Context, runID string, cfg map[string]any) (engine.Outputs, error) {
+	if boolConfig(cfg["management_api"]) {
+		return mgmt{p}.provision(ctx, runID, cfg)
+	}
 	if err := p.checkCLIOrDefault(); err != nil {
 		return nil, err
 	}
@@ -460,6 +500,7 @@ type project struct {
 	ref            string
 	dbHost         string
 	publishableKey string
+	ready          bool // set by the Management API path only
 }
 
 // provisionRun holds what every project in a run shares.
@@ -537,12 +578,23 @@ func refOutputs(c providerConfig, runID string, projects []project) engine.Outpu
 	for i, pr := range projects {
 		refs[i] = pr.ref
 	}
-	return engine.Outputs{
+	return diagnosticsOutputs(c, engine.Outputs{
 		outputKeyProjectRefs:  strings.Join(refs, ","),
 		outputKeyProfile:      c.Profile,
 		outputKeyRunID:        runID,
 		outputKeyProjectCount: strconv.Itoa(c.ProjectCount),
+	})
+}
+
+// diagnosticsOutputs adds the diagnostics settings the scenario set to out.
+func diagnosticsOutputs(c providerConfig, out engine.Outputs) engine.Outputs {
+	if c.DiagnosticsMaxProjects > 0 {
+		out[outputKeyDiagnosticsMaxProjects] = strconv.Itoa(c.DiagnosticsMaxProjects)
 	}
+	if c.DiagnosticsParallel > 0 {
+		out[outputKeyDiagnosticsParallel] = strconv.Itoa(c.DiagnosticsParallel)
+	}
+	return out
 }
 
 // TeardownSeed implements engine.TeardownSeeder. Before any project exists,
@@ -552,6 +604,9 @@ func (p *Provider) TeardownSeed(runID string, cfg map[string]any) engine.Outputs
 	c, err := parseConfig(cfg)
 	if err != nil {
 		return nil
+	}
+	if c.ManagementAPI {
+		return mgmtRefOutputs(c, runID, nil)
 	}
 	return refOutputs(c, runID, nil)
 }
@@ -782,6 +837,11 @@ func notReadyForDeletion(stdout, stderr []byte) bool {
 // project named after the run. On success it also removes the local per-run
 // working directory (see workDirForRun).
 func (p *Provider) Teardown(ctx context.Context, outputs engine.Outputs) error {
+	// The seed records the path that created the projects. Runs from before it
+	// existed have no such key, and go through the CLI.
+	if outputs[outputKeyManagementAPI] == "true" {
+		return mgmt{p}.teardown(ctx, outputs)
+	}
 	refs, names := projectRefs(outputs), runProjectNames(outputs)
 	if len(refs) == 0 && len(names) == 0 {
 		return fmt.Errorf("supabase: teardown: missing %s in outputs", outputKeyProjectRefs)
@@ -863,6 +923,11 @@ func (p *Provider) removeWorkDir(dir string) {
 // collector metadata under the label key "project_id". A run with several
 // projects gets their refs comma-separated, in creation order.
 func (p *Provider) RunMetadata(outputs engine.Outputs) map[string]string {
+	// A Management API run with several projects reports a count: its outputs
+	// hold no refs.
+	if n := outputs[outputKeyProjectsReady]; n != "" {
+		return map[string]string{"project_count": n}
+	}
 	if refs := projectRefs(outputs); len(refs) > 0 {
 		return map[string]string{"project_id": strings.Join(refs, ",")}
 	}
@@ -1177,16 +1242,28 @@ func projectRefByName(data []byte, name, orgID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return refByName(projects, name, orgID)
+}
+
+// refByName is projectRefByName for an already parsed list.
+func refByName(projects []listedProject, name, orgID string) (string, error) {
 	for _, p := range projects {
 		if p.Name != name {
 			continue
 		}
-		if orgID != "" && p.OrganizationID != orgID && p.OrganizationSlug != orgID {
+		if !inOrg(p, orgID) {
 			continue
 		}
 		return p.Ref, nil
 	}
 	return "", fmt.Errorf("no project named %q found in projects list", name)
+}
+
+// inOrg reports whether lp belongs to orgID. The API reports the org as both
+// organization_id and organization_slug; either matching is enough. An empty
+// orgID matches every project.
+func inOrg(lp listedProject, orgID string) bool {
+	return orgID == "" || lp.OrganizationID == orgID || lp.OrganizationSlug == orgID
 }
 
 // connectionDetails returns the host, port, and user for the given connection
@@ -1269,6 +1346,36 @@ func poolerHost(dbHost, region string) string {
 // live where the POST returned 201 but the disk's
 // real attributes never changed.
 func (p *Provider) resizeDiskIfNeeded(ctx context.Context, profile, dbHost, ref string, sizeGB, iops, throughputMibps int, diskType string) error {
+	url := ManagementAPIBase(profile, dbHost) + "/v1/projects/" + ref + "/config/disk"
+	return p.resizeDisk(ctx, url, sizeGB, iops, throughputMibps, diskType)
+}
+
+// resizeDisk is resizeDiskIfNeeded for the disk-config endpoint at url, called
+// directly with the configured access token.
+func (p *Provider) resizeDisk(ctx context.Context, url string, sizeGB, iops, throughputMibps int, diskType string) error {
+	if sizeGB == 0 {
+		return nil
+	}
+	token := p.cfg.Supabase.AccessToken
+	if token == "" {
+		return fmt.Errorf("resize disk: no access token (set BENCHCTL_SUPABASE_ACCESS_TOKEN)")
+	}
+	return p.resizeDiskVia(ctx, directDisk{p: p, url: url, token: token}, sizeGB, iops, throughputMibps, diskType)
+}
+
+// diskAPI reads and changes one project's disk config, so the CLI path and the
+// Management API path can share resizeDiskVia while each sends its requests its
+// own way.
+type diskAPI interface {
+	// get returns the disk's current attributes.
+	get(ctx context.Context) (diskAttrs, error)
+	// resize requests the disk attributes in body, a JSON request body.
+	resize(ctx context.Context, body string) error
+}
+
+// resizeDiskVia grows the disk behind api to at least sizeGB, then waits for
+// the new size to show.
+func (p *Provider) resizeDiskVia(ctx context.Context, api diskAPI, sizeGB, iops, throughputMibps int, diskType string) error {
 	if sizeGB == 0 {
 		return nil
 	}
@@ -1278,13 +1385,8 @@ func (p *Provider) resizeDiskIfNeeded(ctx context.Context, profile, dbHost, ref 
 	if iops == 0 {
 		iops = 3000 // gp3 free baseline
 	}
-	token := p.cfg.Supabase.AccessToken
-	if token == "" {
-		return fmt.Errorf("resize disk: no access token (set BENCHCTL_SUPABASE_ACCESS_TOKEN)")
-	}
-	url := ManagementAPIBase(profile, dbHost) + "/v1/projects/" + ref + "/config/disk"
 
-	current, err := p.getDiskAttrs(ctx, url, token)
+	current, err := api.get(ctx)
 	if err != nil {
 		return fmt.Errorf("resize disk: get current size: %w", err)
 	}
@@ -1298,24 +1400,11 @@ func (p *Provider) resizeDiskIfNeeded(ctx context.Context, profile, dbHost, ref 
 	if throughputMibps > 0 && diskType != diskTypeIO2 {
 		attrs += fmt.Sprintf(`,"throughput_mibps":%d`, throughputMibps)
 	}
-	body := fmt.Sprintf(`{"attributes":{%s}}`, attrs)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("resize disk: build request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := p.doer.Do(req)
-	if err != nil {
+	if err := api.resize(ctx, fmt.Sprintf(`{"attributes":{%s}}`, attrs)); err != nil {
 		return fmt.Errorf("resize disk: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("resize disk: HTTP %d: %s", resp.StatusCode, truncate(respBody, 500))
-	}
 
-	return p.waitForDiskResize(ctx, url, token, sizeGB, iops, diskType)
+	return p.waitForDiskResize(ctx, api, sizeGB, iops, diskType)
 }
 
 // waitForDiskResize polls GET .../config/disk until the reported attributes
@@ -1323,12 +1412,25 @@ func (p *Provider) resizeDiskIfNeeded(ctx context.Context, profile, dbHost, ref 
 // diskResizePollTimeoutOrDefault() elapses without that happening. See
 // resizeDiskIfNeeded's doc comment for why this confirmation can't be
 // skipped.
-func (p *Provider) waitForDiskResize(ctx context.Context, url, token string, sizeGB, iops int, diskType string) error {
+func (p *Provider) waitForDiskResize(ctx context.Context, api diskAPI, sizeGB, iops int, diskType string) error {
 	interval := p.diskResizePollIntervalOrDefault()
-	deadline := time.Now().Add(p.diskResizePollTimeoutOrDefault())
+	timeout := p.diskResizePollTimeoutOrDefault()
+	// The deadline covers the waits for a throttling block to lift, too.
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	var last diskAttrs
+	timedOut := func(err error) error {
+		if ctx.Err() != nil {
+			return err
+		}
+		return fmt.Errorf("resize disk: timed out waiting for %d GB/%d IOPS/%s after %s; disk is still %d GB/%d IOPS/%s",
+			sizeGB, iops, diskType, timeout, last.SizeGB, last.IOPS, last.Type)
+	}
 	for {
-		attrs, err := p.getDiskAttrs(ctx, url, token)
+		attrs, err := api.get(pollCtx)
+		if pollCtx.Err() != nil {
+			return timedOut(err)
+		}
 		if err != nil {
 			return fmt.Errorf("resize disk: verify: %w", err)
 		}
@@ -1337,13 +1439,9 @@ func (p *Provider) waitForDiskResize(ctx context.Context, url, token string, siz
 			consolelog.Println(p.out, fmt.Sprintf("supabase: disk resized to %d GB", attrs.SizeGB))
 			return nil
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("resize disk: timed out waiting for %d GB/%d IOPS/%s after %s; disk is still %d GB/%d IOPS/%s",
-				sizeGB, iops, diskType, p.diskResizePollTimeoutOrDefault(), last.SizeGB, last.IOPS, last.Type)
-		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-pollCtx.Done():
+			return timedOut(pollCtx.Err())
 		case <-time.After(interval):
 		}
 	}
@@ -1357,14 +1455,22 @@ type diskAttrs struct {
 	Type   string
 }
 
-// getDiskAttrs reads the current disk attributes via GET .../config/disk.
-func (p *Provider) getDiskAttrs(ctx context.Context, url, token string) (diskAttrs, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// directDisk is the diskAPI of the CLI path: plain requests to url with the
+// configured token, outside any rate-limit handling.
+type directDisk struct {
+	p     *Provider
+	url   string
+	token string
+}
+
+// get reads the current disk attributes via GET .../config/disk.
+func (d directDisk) get(ctx context.Context) (diskAttrs, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.url, nil)
 	if err != nil {
 		return diskAttrs{}, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := p.doer.Do(req)
+	req.Header.Set("Authorization", "Bearer "+d.token)
+	resp, err := d.p.doer.Do(req)
 	if err != nil {
 		return diskAttrs{}, err
 	}
@@ -1373,6 +1479,35 @@ func (p *Provider) getDiskAttrs(ctx context.Context, url, token string) (diskAtt
 		respBody, _ := io.ReadAll(resp.Body)
 		return diskAttrs{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(respBody, 500))
 	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return diskAttrs{}, err
+	}
+	return parseDiskAttrs(data)
+}
+
+// resize sends body as POST .../config/disk.
+func (d directDisk) resize(ctx context.Context, body string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.url, strings.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+d.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := d.p.doer.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(respBody, 500))
+	}
+	return nil
+}
+
+// parseDiskAttrs reads the attributes out of a GET .../config/disk response.
+func parseDiskAttrs(data []byte) (diskAttrs, error) {
 	var v struct {
 		Attributes struct {
 			SizeGB int    `json:"size_gb"`
@@ -1380,7 +1515,7 @@ func (p *Provider) getDiskAttrs(ctx context.Context, url, token string) (diskAtt
 			Type   string `json:"type"`
 		} `json:"attributes"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+	if err := json.Unmarshal(data, &v); err != nil {
 		return diskAttrs{}, fmt.Errorf("decode response: %w", err)
 	}
 	return diskAttrs{SizeGB: v.Attributes.SizeGB, IOPS: v.Attributes.IOPS, Type: v.Attributes.Type}, nil
@@ -1393,6 +1528,17 @@ var profileAPIBases = map[string]string{
 	"supabase":         "https://api.supabase.com",
 	"supabase-staging": "https://api.supabase.green",
 	"supabase-local":   "http://localhost:8080",
+}
+
+// ProfileAPIBase returns the Management API of a built-in CLI profile, the
+// way the CLI resolves it: no profile means the default, supabase. ok is false
+// for any other profile, such as a path to a YAML profile file.
+func ProfileAPIBase(profile string) (base string, ok bool) {
+	if profile == "" {
+		profile = "supabase"
+	}
+	base, ok = profileAPIBases[profile]
+	return base, ok
 }
 
 // ManagementAPIBase returns the Management API base URL for a project created
@@ -1421,20 +1567,41 @@ type TargetProject struct {
 	DBHost string
 }
 
-// TargetProjects returns every project listed in a run's outputs, in creation
-// order. The DB host comes from the project's api_url_<ref>; runs from before
-// that key existed only recorded host, for their single project.
-func TargetProjects(outputs engine.Outputs) []TargetProject {
+// TargetProjects returns the projects a run's outputs describe. A Management
+// API run with several projects has none listed in its outputs: these are the
+// ready ones in its manifest, in the order they became ready. Otherwise they
+// come from the listed refs, in creation order, with the DB host from the
+// project's api_url_<ref>; runs from before that key existed only recorded
+// host, for their single project.
+func TargetProjects(outputs engine.Outputs) ([]TargetProject, error) {
+	if path := outputs[outputKeyProjectsManifest]; path != "" {
+		events, err := readManifest(path)
+		if err != nil {
+			return nil, err
+		}
+		var projects []TargetProject
+		for _, ev := range events {
+			if ev.E == eventReady {
+				projects = append(projects, TargetProject{Ref: ev.Ref, DBHost: dbHost(ev.APIURL)})
+			}
+		}
+		return projects, nil
+	}
 	refs := projectRefs(outputs)
 	projects := make([]TargetProject, len(refs))
 	for i, ref := range refs {
 		host := outputs["host"]
 		if u := outputs[outputKeyAPIURL+ref]; u != "" {
-			host = "db." + strings.TrimPrefix(u, "https://")
+			host = dbHost(u)
 		}
 		projects[i] = TargetProject{Ref: ref, DBHost: host}
 	}
-	return projects
+	return projects, nil
+}
+
+// dbHost is the inverse of apiURL.
+func dbHost(apiURL string) string {
+	return "db." + strings.TrimPrefix(apiURL, "https://")
 }
 
 // redactArgs returns args as a single string with --db-password values hidden.

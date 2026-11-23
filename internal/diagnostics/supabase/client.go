@@ -14,7 +14,6 @@ package supabase
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,13 +28,17 @@ type httpDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-// apiBase returns the Management API root for project p: the provisioning
-// profile's API, or one derived from the database hostname, so a non-production
-// project is not silently queried against production. The mapping lives
-// in the Supabase provider, which calls the same API to resize disks.
+// apiBase returns the Management API root for project p: the API provisioning
+// used, or for runs that didn't record it, the provisioning profile's API or
+// one derived from the database hostname, so a non-production project is not
+// silently queried against production. The mapping lives in the Supabase
+// provider, which calls the same API to resize disks.
 func (c *Collector) apiBase(p supabaseprovider.TargetProject) string {
-	if c.hostOverride != "" {
+	switch {
+	case c.hostOverride != "":
 		return c.hostOverride + "/v1/projects/" + p.Ref
+	case c.apiURL != "":
+		return c.apiURL + "/v1/projects/" + p.Ref
 	}
 	return supabaseprovider.ManagementAPIBase(c.profile, p.DBHost) + "/v1/projects/" + p.Ref
 }
@@ -63,25 +66,7 @@ func (c *Collector) get(ctx context.Context, p supabaseprovider.TargetProject, p
 		return nil, requestURL, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, requestURL, fmt.Errorf("HTTP %d: %s", resp.StatusCode, apiErrorMessage(body, resp.Status))
+		return nil, requestURL, fmt.Errorf("HTTP %d: %s", resp.StatusCode, supabaseprovider.APIErrorMessage(body, resp.Status))
 	}
 	return body, requestURL, nil
-}
-
-// apiErrorMessage pulls the readable part out of a Management API error,
-// falling back to the status line.
-func apiErrorMessage(body []byte, fallback string) string {
-	var parsed struct {
-		Message string `json:"message"`
-		Error   string `json:"error"`
-	}
-	if err := json.Unmarshal(body, &parsed); err == nil {
-		if parsed.Message != "" {
-			return parsed.Message
-		}
-		if parsed.Error != "" {
-			return parsed.Error
-		}
-	}
-	return fallback
 }
