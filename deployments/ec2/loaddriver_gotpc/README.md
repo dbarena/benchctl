@@ -10,6 +10,7 @@ as the target, so benchmark traffic stays within the VPC.
 |----------|-------------|
 | `instance_type` | EC2 instance type (e.g. `c8gd.xlarge`) |
 | `subnet_id` | Subnet ID; must match `target.outputs.subnet_id` |
+| `pgbench_enabled` | Install pgbench on boot, for scenarios with `type: pgbench` steps (default `false`) |
 
 ## Outputs
 

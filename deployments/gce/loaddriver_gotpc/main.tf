@@ -171,6 +171,18 @@ locals {
     mv /tmp/go-tpc /usr/local/bin/go-tpc
     chmod +x /usr/local/bin/go-tpc
 
+    # ── pgbench (optional) ────────────────────────────────────────────────────
+    # Debian and Ubuntu ship pgbench with the server package, not the client
+    # one. Tell postgresql-common not to create and start a cluster on install:
+    # this instance only drives load.
+    if [ "${var.pgbench_enabled}" = "true" ]; then
+      mkdir -p /etc/postgresql-common/createcluster.d
+      echo 'create_main_cluster = false' > /etc/postgresql-common/createcluster.d/benchctl.conf
+      apt-get install -y --no-install-recommends postgresql
+      ln -sf "$(ls -d /usr/lib/postgresql/*/bin/pgbench | sort -V | tail -n 1)" /usr/local/bin/pgbench
+      pgbench --version
+    fi
+
     # ── Vector (metrics agent) ────────────────────────────────────────────────
     # Install Vector in agent mode. Config is generated from Terraform variables
     # at provision time so the sink matches the benchmark environment.

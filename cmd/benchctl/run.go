@@ -14,6 +14,7 @@ import (
 
 	"github.com/dbarena/benchctl/internal/adapters/gotpc"
 	"github.com/dbarena/benchctl/internal/adapters/k6"
+	"github.com/dbarena/benchctl/internal/adapters/pgbench"
 	"github.com/dbarena/benchctl/internal/adapters/shell"
 	"github.com/dbarena/benchctl/internal/auth"
 	stdoutcollector "github.com/dbarena/benchctl/internal/collectors/stdout"
@@ -215,6 +216,8 @@ func buildWorkloadAdapter(name string) (engine.WorkloadAdapter, error) {
 		return gotpc.New(), nil
 	case "k6":
 		return k6.New(), nil
+	case "pgbench":
+		return pgbench.New(), nil
 	case "shell":
 		return shell.New(), nil
 	default:

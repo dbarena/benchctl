@@ -222,30 +222,43 @@ locals {
     mv /tmp/go-tpc /usr/local/bin/go-tpc
     chmod +x /usr/local/bin/go-tpc
 
-    # ── Vector (metrics agent, optional) ──────────────────────────────────────
-    # Only installed when metrics collection is actually requested: this is
-    # the only remaining step that needs apt-get, so runs whose scenario
-    # leaves collection off (the default) skip apt entirely instead of
-    # installing Vector just to immediately stop/disable it.
-    # Best-effort: apt-get occasionally wedges indefinitely on this mirror (a
-    # connection gets closed by the server, observed stuck in CLOSE-WAIT, but
-    # apt's http method never notices and never times out on its own), so
-    # each call gets a hard per-attempt timeout with retries. If it still
-    # fails, log and move on rather than failing the whole driver bootstrap
-    # over an optional sidecar.
-    if [ "${var.vector_enabled}" = "true" ]; then
-      apt_get_retry() {
-        local attempt
-        for attempt in 1 2 3; do
-          if timeout 60 apt-get "$@"; then
-            return 0
-          fi
-          echo "apt-get $* timed out or failed (attempt $attempt/3), retrying..." >&2
-          sleep 5
-        done
-        return 1
-      }
+    # apt-get occasionally wedges indefinitely on this mirror (a connection
+    # gets closed by the server, observed stuck in CLOSE-WAIT, but apt's http
+    # method never notices and never times out on its own), so each call gets
+    # a hard per-attempt timeout with retries. Only the optional steps below
+    # need apt at all, so runs that enable neither skip it entirely.
+    apt_get_retry() {
+      local attempt
+      for attempt in 1 2 3; do
+        if timeout $${APT_TIMEOUT:-60} apt-get "$@"; then
+          return 0
+        fi
+        echo "apt-get $* timed out or failed (attempt $attempt/3), retrying..." >&2
+        sleep 5
+      done
+      return 1
+    }
 
+    # ── pgbench (optional) ────────────────────────────────────────────────────
+    # Debian and Ubuntu ship pgbench with the server package, not the client
+    # one. Tell postgresql-common not to create and start a cluster on install:
+    # this instance only drives load. Unlike Vector, a failure here fails the
+    # bootstrap, since a scenario that asks for pgbench can't run without it.
+    if [ "${var.pgbench_enabled}" = "true" ]; then
+      mkdir -p /etc/postgresql-common/createcluster.d
+      echo 'create_main_cluster = false' > /etc/postgresql-common/createcluster.d/benchctl.conf
+      apt_get_retry update -y
+      APT_TIMEOUT=300 apt_get_retry install -y --no-install-recommends postgresql
+      ln -sf "$(ls -d /usr/lib/postgresql/*/bin/pgbench | sort -V | tail -n 1)" /usr/local/bin/pgbench
+      pgbench --version
+    fi
+
+    # ── Vector (metrics agent, optional) ──────────────────────────────────────
+    # Only installed when metrics collection is actually requested, rather
+    # than installing Vector just to immediately stop/disable it.
+    # Best-effort: if apt still fails after its retries, log and move on rather
+    # than failing the whole driver bootstrap over an optional sidecar.
+    if [ "${var.vector_enabled}" = "true" ]; then
       if curl -fsSL --connect-timeout 15 --max-time 60 --retry 5 --retry-delay 10 https://setup.vector.dev | timeout 60 bash \
         && apt_get_retry update -y \
         && apt_get_retry install -y vector; then

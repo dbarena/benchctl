@@ -108,6 +108,30 @@ mv "$TMP/go-tpc" "$GOBIN/go-tpc"
 chmod +x "$GOBIN/go-tpc"
 """
 
+[tasks.install-pgbench]
+description = "Install pgbench for ad-hoc use with pgbench scenarios"
+# pgbench ships with the PostgreSQL server packages: Homebrew's postgresql@17
+# (keg-only, found by the pgbench adapter without a PATH change) or Debian's
+# postgresql-NN. Keep apt from creating and starting a cluster on port 5432,
+# where the local docker-compose targets listen.
+run = """
+case "$(uname -s)" in
+  Darwin)
+    brew install postgresql@17
+    ;;
+  Linux)
+    sudo mkdir -p /etc/postgresql-common/createcluster.d
+    echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/benchctl.conf >/dev/null
+    sudo apt-get update -y
+    sudo apt-get install -y --no-install-recommends postgresql
+    ;;
+  *)
+    echo "install pgbench with your OS's PostgreSQL packages" >&2
+    exit 1
+    ;;
+esac
+"""
+
 [tasks.install-k6]
 description = "Install the latest k6 to $GOPATH/bin for ad-hoc use with k6 scenarios"
 run = "go install go.k6.io/k6@latest"

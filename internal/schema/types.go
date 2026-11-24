@@ -150,11 +150,20 @@ const (
 	MetadataCommandRTT = "rtt"
 )
 
+// Values a `type: pgbench` step may set for `command`, and the one arg the
+// pgbench adapter handles itself rather than passing it through to pgbench:
+// the text of a custom script.
+const (
+	PgbenchCommandInit = "init"
+	PgbenchCommandRun  = "run"
+	PgbenchArgScript   = "script"
+)
+
 // SuiteStep is a single unit of work within a SuiteEntry.
 type SuiteStep struct {
 	Name    string            `yaml:"name"`
-	Type    string            `yaml:"type"`    // "metadata" | "sql" | "go-tpc" | "k6"
-	Command string            `yaml:"command"` // "sql"|"rtt" (metadata); "prepare"|"run" (go-tpc); script path (k6); unused for "sql"
+	Type    string            `yaml:"type"`    // "metadata" | "sql" | "go-tpc" | "k6" | "pgbench" | "shell"
+	Command string            `yaml:"command"` // "sql"|"rtt" (metadata); "prepare"|"run" (go-tpc); script path (k6); "init"|"run" (pgbench); unused for "sql"
 	Args    map[string]string `yaml:"args"`
 }
 
