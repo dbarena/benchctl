@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dbarena/benchctl/internal/diagnostics"
+	supabaseprovider "github.com/dbarena/benchctl/internal/providers/supabase"
 )
 
 const (
@@ -29,6 +30,11 @@ const (
 
 	// maxLogBytes bounds the rendered log.
 	maxLogBytes = 8 << 20
+
+	// logQueryAttempts/defaultLogRetryInterval bound how queryLogs retries
+	// the endpoint's transient "Retry your query" error.
+	logQueryAttempts        = 3
+	defaultLogRetryInterval = 5 * time.Second
 )
 
 // logQuery selects the project's Postgres log.
@@ -61,8 +67,8 @@ type analyticsResponse struct {
 	Error  any      `json:"error"`
 }
 
-// collectLog captures the Postgres log over the whole run as plain text.
-func (c *Collector) collectLog(ctx context.Context, req diagnostics.Request, start, end time.Time, res *diagnostics.Result) {
+// collectLog captures project p's Postgres log over the whole run, as plain text in dir.
+func (c *Collector) collectLog(ctx context.Context, req diagnostics.Request, p supabaseprovider.TargetProject, dir string, start, end time.Time, res *diagnostics.Result) {
 	var rows []logRow
 	var lastURL string
 	for _, chunk := range splitSpan(start, end, maxLogChunk) {
@@ -72,33 +78,59 @@ func (c *Collector) collectLog(ctx context.Context, req diagnostics.Request, sta
 		params.Set("iso_timestamp_start", diagnostics.RFC3339(chunk.start))
 		params.Set("iso_timestamp_end", diagnostics.RFC3339(chunk.end))
 
-		body, requestURL, err := c.get(ctx, "/analytics/endpoints/logs", params)
+		result, requestURL, err := c.queryLogs(ctx, p, params)
 		lastURL = requestURL
 		if err != nil {
-			req.Save(res, req.Dest, "postgres.log", "GET "+requestURL, nil, err)
+			req.Save(res, dir, "postgres.log", "GET "+requestURL, nil, err)
 			return
 		}
-		var parsed analyticsResponse
-		if err := json.Unmarshal(body, &parsed); err != nil {
-			req.Save(res, req.Dest, "postgres.log", "GET "+requestURL, nil, fmt.Errorf("parse analytics response: %w", err))
-			return
-		}
-		if msg := errorText(parsed.Error); msg != "" {
-			req.Save(res, req.Dest, "postgres.log", "GET "+requestURL, nil, fmt.Errorf("analytics query: %s", msg))
-			return
-		}
-		rows = append(rows, parsed.Result...)
-		if len(parsed.Result) >= logRowLimit {
+		rows = append(rows, result...)
+		if len(result) >= logRowLimit {
 			res.Warnings = append(res.Warnings,
-				fmt.Sprintf("postgres.log: a slice hit the %d row limit; the log is incomplete", logRowLimit))
+				fmt.Sprintf("%s: a slice hit the %d row limit; the log is incomplete", artifactName(req, dir, "postgres.log"), logRowLimit))
 		}
 	}
 
 	text, notes := renderRows(rows)
 	for _, n := range notes {
-		res.Warnings = append(res.Warnings, "postgres.log: "+n)
+		res.Warnings = append(res.Warnings, artifactName(req, dir, "postgres.log")+": "+n)
 	}
-	req.Save(res, req.Dest, "postgres.log", "GET "+lastURL, []byte(text), nil)
+	req.Save(res, dir, "postgres.log", "GET "+lastURL, []byte(text), nil)
+}
+
+// queryLogs runs one analytics query. The endpoint sometimes fails a query
+// with "Backend error! Retry your query", so that error is retried a few times
+// before it costs the project its log.
+func (c *Collector) queryLogs(ctx context.Context, p supabaseprovider.TargetProject, params url.Values) ([]logRow, string, error) {
+	for attempt := 1; ; attempt++ {
+		body, requestURL, err := c.get(ctx, p, "/analytics/endpoints/logs", params)
+		if err != nil {
+			return nil, requestURL, err
+		}
+		var parsed analyticsResponse
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return nil, requestURL, fmt.Errorf("parse analytics response: %w", err)
+		}
+		msg := errorText(parsed.Error)
+		if msg == "" {
+			return parsed.Result, requestURL, nil
+		}
+		if !strings.Contains(msg, "Retry your query") || attempt == logQueryAttempts {
+			return nil, requestURL, fmt.Errorf("analytics query: %s", msg)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, requestURL, ctx.Err()
+		case <-time.After(c.logRetryIntervalOrDefault()):
+		}
+	}
+}
+
+func (c *Collector) logRetryIntervalOrDefault() time.Duration {
+	if c.logRetryInterval > 0 {
+		return c.logRetryInterval
+	}
+	return defaultLogRetryInterval
 }
 
 // errorText renders the endpoint's error field, which is null on success and

@@ -8,7 +8,7 @@ Install OpenTofu. On MacOS run `brew install opentofu`. See their [installation 
 
 **Supabase CLI** (required only for the `supabase` target provider):
 
-Install the beta version by following the [getting started guide](https://supabase.com/docs/guides/local-development/cli/getting-started#beta-channel). The binary must be invokable as `supabase` from the shell (npm/npx wrappers are not supported).
+Install v3.0.0 or later by following the [getting started guide](https://supabase.com/docs/guides/local-development/cli/getting-started#beta-channel). The binary must be invokable as `supabase` from the shell (npm/npx wrappers are not supported).
 
 Authenticate via `supabase login` or set `BENCHCTL_SUPABASE_ACCESS_TOKEN` to a personal access token.
 
