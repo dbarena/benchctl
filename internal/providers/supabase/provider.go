@@ -1014,7 +1014,7 @@ func generatePassword() (string, error) {
 func checkInstalled() error {
 	if _, err := exec.LookPath("supabase"); err != nil {
 		return fmt.Errorf("supabase provider: supabase CLI not found in PATH\n" +
-			"Install the beta version: https://supabase.com/docs/guides/local-development/cli/getting-started#beta-channel\n" +
+			"Install v3.0.0 or later: https://supabase.com/docs/guides/local-development/cli/getting-started#beta-channel\n" +
 			"The binary must be invokable as `supabase` from the shell (npm/npx wrappers are not supported).")
 	}
 	return nil
@@ -1083,7 +1083,7 @@ func parseProjectRef(data []byte) (string, error) {
 // projects api-keys`. New projects have the legacy anon key disabled.
 func (p *Provider) publishableKey(ctx context.Context, env []string, profile, workDir, ref string) (string, error) {
 	args := globalArgs(profile, workDir)
-	args = append(args, "projects", "api-keys", "--project-ref", ref, "--output-format", "json")
+	args = append(args, "projects", "api-keys", "--remote="+ref, "--output-format", "json")
 	out, err := p.runCapture(ctx, env, args...)
 	if err != nil {
 		detail := CLIErrorDetail(out)

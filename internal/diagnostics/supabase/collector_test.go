@@ -73,7 +73,7 @@ type fakeCLI struct {
 	mu        sync.Mutex
 	calls     [][]string
 	err       error
-	failFor   string // a --project-ref to fail with err; empty fails every call
+	failFor   string // a --remote ref to fail with err; empty fails every call
 	failTimes int    // fail only this many calls; zero fails them all
 	writeTo   func(dir string)
 }
@@ -83,7 +83,7 @@ func (f *fakeCLI) run(_ context.Context, _ []string, args ...string) ([]byte, er
 	f.calls = append(f.calls, args)
 	n := len(f.calls)
 	f.mu.Unlock()
-	if f.err != nil && (f.failFor == "" || slices.Contains(args, f.failFor)) && (f.failTimes == 0 || n <= f.failTimes) {
+	if f.err != nil && (f.failFor == "" || slices.Contains(args, "--remote="+f.failFor)) && (f.failTimes == 0 || n <= f.failTimes) {
 		return nil, f.err
 	}
 	if f.writeTo != nil {
@@ -460,8 +460,8 @@ func TestInspectReport_UsesTheProjectRefNotThePassword(t *testing.T) {
 		t.Fatalf("%d CLI calls, want 1", len(cli.calls))
 	}
 	argv := strings.Join(cli.calls[0], " ")
-	if !strings.Contains(argv, "--project-ref abcdefghijklmnop") {
-		t.Errorf("argv = %q, want --project-ref", argv)
+	if !strings.Contains(argv, "--remote=abcdefghijklmnop") {
+		t.Errorf("argv = %q, want --remote=<ref>", argv)
 	}
 	// --db-url would put the database password in the argv, and from there
 	// into index.json's Command field.

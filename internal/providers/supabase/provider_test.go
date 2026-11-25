@@ -862,7 +862,7 @@ func healthyProjects(names ...string) func(args []string) fakeCmdResponse {
 		case slices.Contains(args, "list"):
 			return fakeCmdResponse{stdout: list}
 		case slices.Contains(args, "api-keys"):
-			ref := args[slices.Index(args, "--project-ref")+1]
+			ref := strings.TrimPrefix(args[slices.IndexFunc(args, func(a string) bool { return strings.HasPrefix(a, "--remote=") })], "--remote=")
 			return fakeCmdResponse{stdout: fmt.Sprintf(`{"keys":[{"name":"anon","type":"legacy","api_key":"anon"},{"name":"default","type":"publishable","api_key":"pub-%s"}]}`, ref)}
 		default: // delete
 			return fakeCmdResponse{}

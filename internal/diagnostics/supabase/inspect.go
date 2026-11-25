@@ -53,12 +53,12 @@ func execCLI(ctx context.Context, env []string, args ...string) ([]byte, error) 
 // Note that pg_stat_statements is cumulative since the last reset, i.e. on a
 // benchmark project they cover provisioning, data loading and the benchmark.
 //
-// --project-ref rather than --db-url on purpose: the CLI then authenticates
+// --remote=<ref> rather than --db-url on purpose: the CLI then authenticates
 // with the access token already needed for the log endpoint.
 func (c *Collector) collectInspectReport(ctx context.Context, req diagnostics.Request, p supabaseprovider.TargetProject, projectDir string, res *diagnostics.Result) {
 	dir := filepath.Join(projectDir, inspectDirName)
 	name := artifactName(req, projectDir, inspectDirName)
-	args := []string{"inspect", "report", "--project-ref", p.Ref, "--output-dir", dir}
+	args := []string{"inspect", "report", "--remote=" + p.Ref, "--output-dir", dir}
 	if c.profile != "" {
 		args = append(args, "--profile", c.profile)
 	}
