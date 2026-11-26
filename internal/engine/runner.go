@@ -268,30 +268,21 @@ func (r *Runner) Run(ctx context.Context, s *schema.Scenario, inputs schema.Reso
 		}
 		return fmt.Errorf("provision target: %w", err)
 	}
-	tc.ProviderOutputs = rawTargetOutputs
-	targetOutputs := rawTargetOutputs
-	if len(s.Target.Outputs) > 0 {
-		mapped, err := ResolveMap(s.Target.Outputs, tc)
-		if err != nil {
-			return fmt.Errorf("resolve target outputs: %w", err)
-		}
-		for k, v := range rawTargetOutputs {
-			if strings.HasPrefix(k, "_") {
-				mapped[k] = v
-			}
-		}
-		targetOutputs = Outputs(mapped)
-	}
 	teardowns = append(teardowns, func(ctx context.Context) error {
 		r.logf("Tearing down target [%s]", s.Target.Provider)
-		return r.Target.Teardown(ctx, targetOutputs)
+		return r.Target.Teardown(ctx, rawTargetOutputs)
 	})
+	tc.ProviderOutputs = rawTargetOutputs
+	targetOutputs, err := mapTargetOutputs(s, tc, rawTargetOutputs)
+	if err != nil {
+		return err
+	}
 	tc.TargetOutputs = targetOutputs
 
 	// Persist target outputs now so that benchctl teardown works if the run
 	// is left lingering (--no-teardown / --linger-on-failure) after a deploy failure.
 	r.setState(runID, func(st *runstate.State) {
-		st.TargetOutputs = map[string]string(targetOutputs)
+		st.TargetOutputs = map[string]string(rawTargetOutputs)
 	})
 
 	if rawTargetOutputs["public_ip"] != "" {
@@ -316,10 +307,10 @@ func (r *Runner) Run(ctx context.Context, s *schema.Scenario, inputs schema.Reso
 
 	r.setState(runID, func(st *runstate.State) {
 		st.Phases[runstate.PhaseProvision] = runstate.StatusCompleted
-		st.TargetOutputs = map[string]string(targetOutputs)
+		st.TargetOutputs = map[string]string(rawTargetOutputs)
 		st.DriverOutputs = map[string]string(driverOutputs)
 	})
-	r.packTofuState(runID, targetOutputs, driverOutputs)
+	r.packTofuState(runID, rawTargetOutputs, driverOutputs)
 
 	// --- driver.setup ---
 	r.setState(runID, func(st *runstate.State) {
@@ -448,7 +439,7 @@ func (r *Runner) Run(ctx context.Context, s *schema.Scenario, inputs schema.Reso
 				collectorCfg["scenario"] = s.Metadata.Name
 				var targetMeta map[string]string
 				if tm, ok := r.Target.(TargetMetadata); ok {
-					targetMeta = tm.RunMetadata(targetOutputs)
+					targetMeta = tm.RunMetadata(rawTargetOutputs)
 				}
 				autoMeta := maps.Clone(targetMeta)
 				if autoMeta == nil {
@@ -616,32 +607,24 @@ func (r *Runner) RunAsync(ctx context.Context, s *schema.Scenario, inputs schema
 		}
 		return runID, fmt.Errorf("provision target: %w", err)
 	}
-	tc.ProviderOutputs = rawTargetOutputs
-	targetOutputs := rawTargetOutputs
-	if len(s.Target.Outputs) > 0 {
-		mapped, err := ResolveMap(s.Target.Outputs, tc)
-		if err != nil {
-			return runID, fmt.Errorf("resolve target outputs: %w", err)
-		}
-		for k, v := range rawTargetOutputs {
-			if strings.HasPrefix(k, "_") {
-				mapped[k] = v
-			}
-		}
-		targetOutputs = Outputs(mapped)
-	}
-	tc.TargetOutputs = targetOutputs
 	teardowns = append(teardowns, func(ctx context.Context) error {
 		r.logf("Tearing down target [%s]", s.Target.Provider)
-		return r.Target.Teardown(ctx, targetOutputs)
+		return r.Target.Teardown(ctx, rawTargetOutputs)
 	})
 
 	// Persist target outputs now so teardown can locate the tofu work dir even if
 	// deployRemoteServices or driver provisioning fails and we return early.
 	r.setState(runID, func(st *runstate.State) {
-		st.TargetOutputs = map[string]string(targetOutputs)
+		st.TargetOutputs = map[string]string(rawTargetOutputs)
 	})
-	r.packTofuState(runID, targetOutputs, nil)
+	r.packTofuState(runID, rawTargetOutputs, nil)
+
+	tc.ProviderOutputs = rawTargetOutputs
+	targetOutputs, err := mapTargetOutputs(s, tc, rawTargetOutputs)
+	if err != nil {
+		return runID, err
+	}
+	tc.TargetOutputs = targetOutputs
 
 	if rawTargetOutputs["public_ip"] != "" {
 		if err := r.deployRemoteServices(ctx, targetCfg, rawTargetOutputs); err != nil {
@@ -666,10 +649,10 @@ func (r *Runner) RunAsync(ctx context.Context, s *schema.Scenario, inputs schema
 				return r.Driver.Teardown(ctx, driverOutputs)
 			})
 			r.setState(runID, func(st *runstate.State) {
-				st.TargetOutputs = map[string]string(targetOutputs)
+				st.TargetOutputs = map[string]string(rawTargetOutputs)
 				st.DriverOutputs = map[string]string(driverOutputs)
 			})
-			r.packTofuState(runID, targetOutputs, driverOutputs)
+			r.packTofuState(runID, rawTargetOutputs, driverOutputs)
 		}
 		return runID, fmt.Errorf("provision driver: %w", err)
 	}
@@ -678,10 +661,10 @@ func (r *Runner) RunAsync(ctx context.Context, s *schema.Scenario, inputs schema
 	// copy below fails and we return early with running infra.
 	r.setState(runID, func(st *runstate.State) {
 		st.Phases[runstate.PhaseProvision] = runstate.StatusCompleted
-		st.TargetOutputs = map[string]string(targetOutputs)
+		st.TargetOutputs = map[string]string(rawTargetOutputs)
 		st.DriverOutputs = map[string]string(driverOutputs)
 	})
-	r.packTofuState(runID, targetOutputs, driverOutputs)
+	r.packTofuState(runID, rawTargetOutputs, driverOutputs)
 	teardowns = append(teardowns, func(ctx context.Context) error {
 		r.logf("Tearing down driver [%s]", s.Driver.Provider)
 		return r.Driver.Teardown(ctx, driverOutputs)
@@ -699,9 +682,8 @@ func (r *Runner) RunAsync(ctx context.Context, s *schema.Scenario, inputs schema
 		// ssh_private_key_path (local absolute path) is preserved for
 		// `benchctl connect target` which runs on the local machine.
 		rawTargetOutputs[outputKeyDriverTargetKeyPath] = newKeyPath
-		targetOutputs[outputKeyDriverTargetKeyPath] = newKeyPath
 		r.setState(runID, func(st *runstate.State) {
-			st.TargetOutputs = map[string]string(targetOutputs)
+			st.TargetOutputs = map[string]string(rawTargetOutputs)
 		})
 	}
 
@@ -767,9 +749,13 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 	r.initStateMu()
 	runID := state.RunID
 	inputs := rehydrateInputs(state.Inputs, s.Inputs)
-	targetOutputs := Outputs(state.TargetOutputs)
-	tc := &TemplateContext{Inputs: inputs, TargetOutputs: targetOutputs}
-	tc.ProviderOutputs = targetOutputs
+	rawTargetOutputs := Outputs(state.TargetOutputs)
+	tc := &TemplateContext{Inputs: inputs, ProviderOutputs: rawTargetOutputs}
+	targetOutputs, err := mapTargetOutputs(s, tc, rawTargetOutputs)
+	if err != nil {
+		return err
+	}
+	tc.TargetOutputs = targetOutputs
 	toolVersions := collectToolVersionLabels(ctx, r.Workloads)
 
 	if pf, ok := r.Collector.(CollectorPreflight); ok {
@@ -824,7 +810,7 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 	driverOutputs := Outputs(state.DriverOutputs)
 	collectorProvider, _ := Resolve(s.Collector.Provider, tc)
 	resumeBlp, _ := r.Target.(BenchmarkLifecycleProvider)
-	resumeRemote := targetOutputs["public_ip"] != ""
+	resumeRemote := rawTargetOutputs["public_ip"] != ""
 
 	fixtureCombos, err := schema.ExpandFixtures(s.Suite.Fixtures, inputs)
 	if err != nil {
@@ -851,15 +837,15 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 					if resumeBlp != nil {
 						started, startErr = resumeBlp.StartBenchmark(ctx, targetCfgResume, entry.Using)
 					} else if resumeRemote {
-						started, startErr = r.startRemoteService(ctx, targetCfgResume, targetOutputs, entry.Using)
+						started, startErr = r.startRemoteService(ctx, targetCfgResume, rawTargetOutputs, entry.Using)
 					}
 					if startErr != nil {
 						return fmt.Errorf("start benchmark %q: %w", entry.Name, startErr)
 					}
 					for k, v := range started {
-						targetOutputs[k] = v
+						rawTargetOutputs[k] = v
 					}
-					if digest := targetOutputs["service."+entry.Using+".image_digest"]; digest != "" {
+					if digest := rawTargetOutputs["service."+entry.Using+".image_digest"]; digest != "" {
 						if infoMap == nil {
 							infoMap = make(map[string]string)
 						}
@@ -869,7 +855,7 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 
 				var stepOutputs Outputs
 				if entry.Using != "" {
-					stepOutputs = buildServiceOutputs(targetOutputs, entry.Using)
+					stepOutputs = buildServiceOutputs(rawTargetOutputs, entry.Using)
 				} else {
 					stepOutputs = targetOutputs
 				}
@@ -915,7 +901,7 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 					collectorCfg["scenario"] = s.Metadata.Name
 					var targetMeta map[string]string
 					if tm, ok := r.Target.(TargetMetadata); ok {
-						targetMeta = tm.RunMetadata(targetOutputs)
+						targetMeta = tm.RunMetadata(rawTargetOutputs)
 					}
 					autoMeta := maps.Clone(targetMeta)
 					if autoMeta == nil {
@@ -952,7 +938,7 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 					if resumeBlp != nil {
 						stopErr = resumeBlp.StopBenchmark(ctx, targetCfgResume, entry.Using)
 					} else if resumeRemote {
-						stopErr = r.stopRemoteService(ctx, targetCfgResume, targetOutputs, entry.Using)
+						stopErr = r.stopRemoteService(ctx, targetCfgResume, rawTargetOutputs, entry.Using)
 					}
 					if stopErr != nil {
 						return fmt.Errorf("stop benchmark %q: %w", entry.Name, stopErr)
@@ -960,7 +946,7 @@ func (r *Runner) Resume(ctx context.Context, s *schema.Scenario, state *runstate
 				}
 
 				if !isLastOverall {
-					if err := r.runBetweenBenchmarksSteps(ctx, s.Suite.BetweenBenchmarks, targetOutputs); err != nil {
+					if err := r.runBetweenBenchmarksSteps(ctx, s.Suite.BetweenBenchmarks, rawTargetOutputs); err != nil {
 						return fmt.Errorf("between-benchmarks: %w", err)
 					}
 				}
@@ -1503,6 +1489,29 @@ func formatFixture(combo schema.ResolvedFixture) string {
 func (r *Runner) storeIsShared() bool {
 	ss, ok := r.Store.(runstate.SharedStore)
 	return ok && ss.IsShared()
+}
+
+// mapTargetOutputs returns the target outputs that the scenario sees as
+// target.outputs: raw, or the result of the scenario's target.outputs block,
+// resolved with tc. The block keeps every raw key that starts with "_".
+//
+// Only templates, driver setup and workloads get the mapped outputs. The run
+// state, teardown and RunMetadata get raw, because the provider reads its own
+// keys.
+func mapTargetOutputs(s *schema.Scenario, tc *TemplateContext, raw Outputs) (Outputs, error) {
+	if len(s.Target.Outputs) == 0 {
+		return raw, nil
+	}
+	mapped, err := ResolveMap(s.Target.Outputs, tc)
+	if err != nil {
+		return nil, fmt.Errorf("resolve target outputs: %w", err)
+	}
+	for k, v := range raw {
+		if strings.HasPrefix(k, "_") {
+			mapped[k] = v
+		}
+	}
+	return Outputs(mapped), nil
 }
 
 // seedTargetTeardown records the target's teardown seed (see TeardownSeeder)
