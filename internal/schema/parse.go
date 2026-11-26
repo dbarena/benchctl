@@ -159,6 +159,17 @@ func (s *Scenario) Validate() error {
 			if step.Type == "shell" && step.Args["command"] == "" {
 				return fmt.Errorf("suite.benchmarks[%d].steps[%d] (%q): type \"shell\" requires args.command", i, j, step.Name)
 			}
+			if step.Type == "pgbench" {
+				switch step.Command {
+				case PgbenchCommandInit:
+					if _, ok := step.Args[PgbenchArgScript]; ok {
+						return fmt.Errorf("suite.benchmarks[%d].steps[%d] (%q): type \"pgbench\" takes args.%s only with command %q", i, j, step.Name, PgbenchArgScript, PgbenchCommandRun)
+					}
+				case PgbenchCommandRun:
+				default:
+					return fmt.Errorf("suite.benchmarks[%d].steps[%d] (%q): type \"pgbench\" has unknown command %q (want %q or %q)", i, j, step.Name, step.Command, PgbenchCommandInit, PgbenchCommandRun)
+				}
+			}
 		}
 	}
 	for i, step := range s.Suite.BetweenBenchmarks {

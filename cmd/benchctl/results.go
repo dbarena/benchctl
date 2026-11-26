@@ -20,7 +20,8 @@ var resultsCmd = &cobra.Command{
 	Use:   "results <run-id>",
 	Short: "Show benchmark results for a completed run",
 	Long: `results queries VictoriaMetrics for the metrics tagged with the given run
-ID and renders a per-transaction summary table. Set metrics.endpoint first, with
+ID and renders a per-transaction summary table (go-tpc) and a per-step one
+(pgbench). Set metrics.endpoint first, with
 'benchctl config set metrics.endpoint <url>' or BENCHCTL_METRICS_ENDPOINT.`,
 	Args: cobra.ExactArgs(1),
 	RunE: showResults,
@@ -108,10 +109,61 @@ type txStats struct {
 	hasLatency                                    bool
 }
 
+// pgbenchStats holds one pgbench run's row for the results table.
+type pgbenchStats struct {
+	TPS, Transactions, Failed, Avg, Stddev, Duration float64
+	hasFailed, hasAvg, hasStddev                     bool
+}
+
 type benchmarkGroup struct {
 	infoLabels map[string]string
 	ok         map[string]*txStats
 	errMap     map[string]*txStats
+	pgbench    map[string]*pgbenchStats
+}
+
+// pgbenchRowKey names a pgbench row by its step and, for a fixture sweep,
+// the fixture values, so that runs at different client counts stay apart.
+func pgbenchRowKey(labels map[string]string) string {
+	key := labels["step"]
+	var fixtures []string
+	for k, v := range labels {
+		if strings.HasPrefix(k, "fixture_") {
+			fixtures = append(fixtures, strings.TrimPrefix(k, "fixture_")+"="+v)
+		}
+	}
+	sort.Strings(fixtures)
+	if len(fixtures) > 0 {
+		key += " [" + strings.Join(fixtures, " ") + "]"
+	}
+	return key
+}
+
+// addPgbenchSample records a pgbench_* sample in its row.
+func (g *benchmarkGroup) addPgbenchSample(name string, labels map[string]string, val float64) {
+	key := pgbenchRowKey(labels)
+	row := g.pgbench[key]
+	if row == nil {
+		row = &pgbenchStats{}
+		g.pgbench[key] = row
+	}
+	switch name {
+	case "pgbench_tps":
+		row.TPS = val
+	case "pgbench_transactions":
+		row.Transactions = val
+	case "pgbench_failed_transactions":
+		row.Failed, row.hasFailed = val, true
+	case "pgbench_duration_seconds":
+		row.Duration = val
+	case "pgbench_latency_ms":
+		switch labels["stat"] {
+		case "avg":
+			row.Avg, row.hasAvg = val, true
+		case "stddev":
+			row.Stddev, row.hasStddev = val, true
+		}
+	}
 }
 
 func renderResults(w io.Writer, runID string, samples []vmSample) {
@@ -128,6 +180,7 @@ func renderResults(w io.Writer, runID string, samples []vmSample) {
 				infoLabels: make(map[string]string),
 				ok:         make(map[string]*txStats),
 				errMap:     make(map[string]*txStats),
+				pgbench:    make(map[string]*pgbenchStats),
 			}
 			benchOrder = append(benchOrder, bm)
 		}
@@ -142,6 +195,11 @@ func renderResults(w io.Writer, runID string, samples []vmSample) {
 					g.infoLabels[k] = v
 				}
 			}
+			continue
+		}
+
+		if strings.HasPrefix(name, "pgbench_") {
+			g.addPgbenchSample(name, s.Metric, val)
 			continue
 		}
 
@@ -207,6 +265,7 @@ func renderResults(w io.Writer, runID string, samples []vmSample) {
 			fmt.Fprintln(tw, "Errors:")
 			printTable(tw, g.errMap)
 		}
+		printPgbenchTable(tw, g.pgbench)
 		tw.Flush()
 	}
 }
@@ -235,6 +294,37 @@ func printTable(w io.Writer, rows map[string]*txStats) {
 			dur,
 		)
 	}
+}
+
+func printPgbenchTable(w io.Writer, rows map[string]*pgbenchStats) {
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "Step\tTPS\tavg ms\tstddev ms\tTransactions\tFailed\tDuration")
+	for _, key := range sortedKeys(rows) {
+		r := rows[key]
+		dur := ""
+		if r.Duration > 0 {
+			dur = strconv.FormatFloat(r.Duration, 'f', 0, 64) + "s"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			key,
+			fmtF(r.TPS),
+			fmtOptF(r.Avg, r.hasAvg, 3),
+			fmtOptF(r.Stddev, r.hasStddev, 3),
+			strconv.FormatFloat(r.Transactions, 'f', 0, 64),
+			fmtOptF(r.Failed, r.hasFailed, 0),
+			dur,
+		)
+	}
+}
+
+// fmtOptF formats a figure pgbench may not have printed, as "-" if absent.
+func fmtOptF(v float64, ok bool, prec int) string {
+	if !ok {
+		return "-"
+	}
+	return strconv.FormatFloat(v, 'f', prec, 64)
 }
 
 func fmtF(v float64) string {

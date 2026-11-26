@@ -201,6 +201,7 @@ func TestValidateScenario_Valid(t *testing.T) {
 	for _, f := range []string{
 		"../../scenarios/postgres-tpcc-local.yaml",
 		"../../scenarios/postgres-tpcc-ec2.yaml",
+		"../../scenarios/postgres-pgbench-local.yaml",
 	} {
 		if err := validateScenario(nil, []string{f}); err != nil {
 			t.Errorf("%s: %v", f, err)

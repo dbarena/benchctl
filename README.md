@@ -227,6 +227,7 @@ Install workload tools locally for ad-hoc use:
 ```bash
 mise run install-go-tpc   # → $GOPATH/bin/go-tpc
 mise run install-k6       # → $GOPATH/bin/k6
+mise run install-pgbench  # Homebrew postgresql@17, or apt postgresql
 ```
 
 ## Further reading
@@ -235,4 +236,5 @@ mise run install-k6       # → $GOPATH/bin/k6
 - [docs/state-store.md](docs/state-store.md): local vs remote store, authentication, CI setup, admin operations
 - [docs/metrics.md](docs/metrics.md): VictoriaMetrics, Grafana, local observability stack
 - [docs/fixtures.md](docs/fixtures.md): multi-dimensional benchmarking with parameter sweeps
+- [docs/pgbench.md](docs/pgbench.md): the pgbench workload adapter: commands, arguments, metrics, installing pgbench
 - [docs/performance-analysis.md](docs/performance-analysis.md): CPU profiling, flamegraphs, hardware counters

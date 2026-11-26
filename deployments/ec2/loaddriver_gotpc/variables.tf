@@ -1,3 +1,9 @@
+variable "pgbench_enabled" {
+  description = "Whether to install pgbench on boot, for scenarios with `type: pgbench` steps. When false, it is not installed at all."
+  type        = bool
+  default     = false
+}
+
 variable "vector_enabled" {
   description = "Whether to install and start the Vector metrics agent on boot. When false, Vector is not installed at all."
   type        = bool

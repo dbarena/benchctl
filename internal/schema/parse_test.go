@@ -561,3 +561,53 @@ func TestValidateMetadata_UnknownCommand(t *testing.T) {
 		t.Errorf("error %q should name the bad command", err)
 	}
 }
+
+func pgbenchScenario(step schema.SuiteStep) *schema.Scenario {
+	return &schema.Scenario{
+		APIVersion: "bench/v1",
+		Kind:       "Scenario",
+		Metadata:   schema.Metadata{Name: "test"},
+		Target:     schema.Target{Provider: "docker-compose"},
+		Driver:     schema.Driver{Provider: "local"},
+		Collector:  schema.Collector{Provider: "stdout"},
+		Suite: schema.Suite{
+			Benchmarks: []schema.SuiteEntry{{Name: "test", Steps: []schema.SuiteStep{step}}},
+		},
+	}
+}
+
+func TestValidatePgbenchStepCommands(t *testing.T) {
+	for _, cmd := range []string{schema.PgbenchCommandInit, schema.PgbenchCommandRun} {
+		s := pgbenchScenario(schema.SuiteStep{Name: "bench", Type: "pgbench", Command: cmd})
+		if err := s.Validate(); err != nil {
+			t.Errorf("command %q: Validate() = %v, want nil", cmd, err)
+		}
+	}
+}
+
+func TestValidatePgbenchStepUnknownCommand(t *testing.T) {
+	for _, cmd := range []string{"", "prepare"} {
+		s := pgbenchScenario(schema.SuiteStep{Name: "bench", Type: "pgbench", Command: cmd})
+		err := s.Validate()
+		if err == nil {
+			t.Fatalf("command %q: expected an error, got nil", cmd)
+		}
+		if !strings.Contains(err.Error(), "unknown command") {
+			t.Errorf("command %q: error %q should mention the unknown command", cmd, err)
+		}
+	}
+}
+
+func TestValidatePgbenchInitRejectsScript(t *testing.T) {
+	s := pgbenchScenario(schema.SuiteStep{
+		Name: "load", Type: "pgbench", Command: schema.PgbenchCommandInit,
+		Args: map[string]string{schema.PgbenchArgScript: "SELECT 1;"},
+	})
+	err := s.Validate()
+	if err == nil {
+		t.Fatal("expected an error for args.script on init, got nil")
+	}
+	if !strings.Contains(err.Error(), "args.script") {
+		t.Errorf("error %q should mention args.script", err)
+	}
+}

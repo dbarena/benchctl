@@ -7,7 +7,7 @@ A scenario is a YAML file that defines a benchmark along four orthogonal axes:
 | Axis | What it describes | Examples |
 |---|---|---|
 | **Target** | Database under test | `docker-compose`, `opentofu`, `supabase` |
-| **Workload** | Load to generate | `go-tpc`, `k6`, `shell` |
+| **Workload** | Load to generate | `go-tpc`, `k6`, `pgbench` (see [pgbench.md](pgbench.md)), `shell` |
 | **Driver** | Where the load generator runs | `local`, `ec2` |
 | **Collector** | Where results go | `stdout`, `victoriametrics` |
 

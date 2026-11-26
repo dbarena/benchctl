@@ -31,6 +31,7 @@ for what it disables and why.
 | `instance_type` | GCE machine type (default `c4a-standard-4`) |
 | `network` / `subnetwork` | Must match `target.outputs.network` / `target.outputs.subnetwork` for co-location. When null, the module creates its own VPC/subnetwork |
 | `zone` | Must match `target.outputs.zone` for co-location |
+| `pgbench_enabled` | Install pgbench on boot, for scenarios with `type: pgbench` steps (default `false`) |
 
 ## Outputs
 
