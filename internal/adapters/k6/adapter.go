@@ -8,16 +8,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/dbarena/benchctl/internal/engine"
 	"github.com/dbarena/benchctl/internal/schema"
 )
 
-type cmdRunner func(ctx context.Context, out io.Writer, name string, args ...string) ([]byte, error)
+// cmdRunner runs name with args. env holds KEY=VALUE pairs that the child
+// process gets in addition to the parent's environment; a pair in env takes
+// precedence over an inherited variable of the same name.
+type cmdRunner func(ctx context.Context, out io.Writer, env []string, name string, args ...string) ([]byte, error)
 
 // Adapter implements engine.WorkloadAdapter for k6.
 type Adapter struct {
@@ -40,8 +44,7 @@ func newWithRunner(r cmdRunner) *Adapter {
 
 // Run executes the k6 benchmark and returns parsed metrics.
 func (a *Adapter) Run(ctx context.Context, outputs engine.Outputs, step schema.SuiteStep) (engine.Metrics, error) {
-	args := buildCmd(outputs, step)
-	out, err := a.run(ctx, a.out, "k6", args...)
+	out, err := a.run(ctx, a.out, buildEnv(outputs), "k6", buildCmd(step)...)
 	if err != nil {
 		return nil, fmt.Errorf("k6 run: %w\noutput: %s", err, out)
 	}
@@ -58,7 +61,7 @@ func (a *Adapter) Run(ctx context.Context, outputs engine.Outputs, step schema.S
 // Best-effort: any failure to run or parse the command logs a warning to
 // a.out and returns nil rather than failing the run.
 func (a *Adapter) VersionInfo(ctx context.Context) map[string]string {
-	out, err := a.run(ctx, io.Discard, "k6", "version", "--json")
+	out, err := a.run(ctx, io.Discard, nil, "k6", "version", "--json")
 	if err != nil {
 		fmt.Fprintf(a.out, "warning: k6 version: %v\n", err)
 		return nil
@@ -77,26 +80,22 @@ func (a *Adapter) VersionInfo(ctx context.Context) map[string]string {
 	}
 }
 
-// buildCmd constructs the k6 invocation.
+// buildCmd constructs the arguments of the k6 invocation.
 //
-// step.Command is the script file path.
-// step.Args are passed as --vus, --duration, --iterations, etc.
-// Target outputs are forwarded to the k6 script as --env KEY=VALUE.
-func buildCmd(outputs engine.Outputs, step schema.SuiteStep) []string {
-	args := []string{"run", "--summary-export", "summary.json", "--new-machine-readable-summary"}
+// step.Command is the script file path. step.Args become k6 options in sorted
+// order:
+//
+// * a non-empty value gives "--key value"
+// * an empty value becomes a bare "--key"
+//
+// Target outputs go to the environment; see buildEnv.
+func buildCmd(step schema.SuiteStep) []string {
+	// --include-system-env-vars is the default of "k6 run"; setting it makes
+	// the contract with buildEnv explicit.
+	args := []string{"run", "--summary-export", "summary.json", "--new-machine-readable-summary", "--include-system-env-vars"}
 
-	// Pass target outputs to k6 as environment variables (sorted for determinism).
-	keys := make([]string, 0, len(outputs))
-	for k := range outputs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		args = append(args, "--env", k+"="+outputs[k])
-	}
-
-	for k, v := range step.Args {
-		if v == "" {
+	for _, k := range slices.Sorted(maps.Keys(step.Args)) {
+		if v := step.Args[k]; v == "" {
 			args = append(args, "--"+k)
 		} else {
 			args = append(args, "--"+k, v)
@@ -108,6 +107,25 @@ func buildCmd(outputs engine.Outputs, step schema.SuiteStep) []string {
 	}
 
 	return args
+}
+
+// buildEnv returns the target outputs as KEY=VALUE pairs, sorted by key. A
+// k6 script reads them from __ENV under the output's own name, for example
+// __ENV.host or __ENV["service.db.host"]. The outputs stay off the command
+// line, so secrets such as the password do not show in the process list or
+// the run log.
+//
+// The pairs reach the k6 process itself, not only the script's __ENV. An
+// output named PATH, HTTP_PROXY or K6_* would therefore change how k6 runs.
+// Today all provider outputs are lowercase (host, api_url_<ref>), dotted
+// (service.<name>.host) or start with "_" (_tofu_work_dir), so none of them
+// collides with such a variable.
+func buildEnv(outputs engine.Outputs) []string {
+	env := make([]string, 0, len(outputs))
+	for _, k := range slices.Sorted(maps.Keys(outputs)) {
+		env = append(env, k+"="+outputs[k])
+	}
+	return env
 }
 
 // parseMetrics reads summary.json from the current working directory and
@@ -215,7 +233,7 @@ func processMetricValues(name, typ string, values map[string]any, baseLabels map
 		for k := range values {
 			stats = append(stats, k)
 		}
-		sort.Strings(stats)
+		slices.Sort(stats)
 		for _, stat := range stats {
 			v := values[stat]
 			if v == nil {
@@ -240,8 +258,11 @@ func mapK6MetricName(k6Name string) string {
 	return "k6_" + k6Name
 }
 
-func execRun(ctx context.Context, out io.Writer, name string, args ...string) ([]byte, error) {
+func execRun(ctx context.Context, out io.Writer, env []string, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	// exec uses the last value of a duplicate key, so env takes precedence
+	// over an inherited variable of the same name.
+	cmd.Env = append(os.Environ(), env...)
 	var buf bytes.Buffer
 	w := io.Writer(&buf)
 	if out != nil && out != io.Discard {

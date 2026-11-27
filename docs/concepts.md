@@ -114,6 +114,14 @@ value, and whether they're required) along with its fixtures and benchmark steps
 it. Add `--set` to preview the effect of an override, for example on a fixture's resolved values,
 before committing to a run.
 
+## k6 steps
+
+A `type: k6` step runs `k6 run` with the script in `command`. Each step argument becomes a k6 option, in sorted order: `vus: "10"` becomes `--vus 10`, and an empty value becomes a bare flag.
+
+benchctl passes the target outputs to the k6 process as environment variables with the same names, so a script reads them from `__ENV`, for example `__ENV.host` or `__ENV.password`. A name with a dot, such as the `service.db.host` output of the `docker-compose` provider, needs the bracket form: `__ENV["service.db.host"]`. The outputs do not appear on the k6 command line, so the run log does not show them.
+
+An output takes precedence over an environment variable of the same name that benchctl itself got. The outputs reach the k6 process itself, so an output named, for example, `PATH`, `HTTP_PROXY` or `K6_VUS` would also change how k6 runs. The outputs of the built-in providers are lowercase, dotted or start with `_`, so none of them has such a name.
+
 ## Run metadata
 
 A `type: metadata` step records one value under `args.name`. benchctl shows these values under `Metadata` in `benchctl status <run-id>` and pushes them to the state store after `driver.collect` completes. The step's `command` selects what to record:
